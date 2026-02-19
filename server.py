@@ -1,0 +1,1585 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional, Dict, Any
+import uuid
+from datetime import datetime, timedelta
+import jwt
+import bcrypt
+import httpx
+from bs4 import BeautifulSoup
+import re
+from urllib.parse import urlparse
+# from emergentintegrations.llm.chat import LlmChat, UserMessage
+import asyncio
+import random
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+client = None
+db = None
+
+def get_db():
+    global client, db
+    if client is None:
+        client = AsyncIOMotorClient(os.environ["MONGO_URL"])
+        db = client[os.environ.get("DB_NAME", "stash_db")]
+    return db
+
+db = get_db()
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'stash_db')]
+
+# JWT Configuration
+SECRET_KEY = os.environ.get('JWT_SECRET', 'stash-secret-key-change-in-production')
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24 * 7  # 7 days
+
+# Create the main app
+app = FastAPI(title="Stash API")
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+# Security
+security = HTTPBearer()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============== Models ==============
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: Optional[str] = None
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class NotificationPrefs(BaseModel):
+    weekly_review: bool = True
+    pending_actions: bool = True
+    resurface: bool = True
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+    username: Optional[str] = None
+    avatar_url: Optional[str] = None
+    plan_type: str = "free"
+    is_pro: bool = False
+    pro_expires_at: Optional[datetime] = None
+
+    push_token: Optional[str] = None
+    notifications_enabled: Optional[bool] = False
+    notification_prefs: Optional[NotificationPrefs] = None
+
+    created_at: datetime 
+
+    
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+# Plan limits
+FREE_PLAN_LIMITS = {
+    "max_collections": 5,
+    "max_items": 50,
+    "advanced_search": False,
+    "smart_reminders": False,
+    "vault_export": False,
+    "ai_features": False,
+}
+
+PRO_PLAN_LIMITS = {
+    "max_collections": -1,  # Unlimited
+    "max_items": -1,  # Unlimited
+    "advanced_search": True,
+    "smart_reminders": True,
+    "vault_export": True,
+    "ai_features": True,
+}
+
+
+
+def get_user_limits(user: dict) -> dict:
+    """Get limits based on user's plan"""
+    if user.get("is_pro") or user.get("plan_type") == "pro":
+        return PRO_PLAN_LIMITS
+    return FREE_PLAN_LIMITS
+
+class SavedItemCreate(BaseModel):
+    url: str
+    title: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    platform: Optional[str] = None
+    content_type: Optional[str] = None
+    notes: Optional[str] = ""
+    tags: List[str] = []
+    collections: List[str] = []
+
+class SavedItemUpdate(BaseModel):
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    collections: Optional[List[str]] = None
+
+class SavedItemResponse(BaseModel):
+    id: str
+    user_id: str
+    url: str
+    title: str
+    thumbnail_url: Optional[str] = None
+    platform: str
+    content_type: str
+    notes: str = ""
+    tags: List[str] = []
+    collections: List[str] = []
+    created_at: datetime
+    ai_summary: Optional[List[str]] = None
+    suggested_collection: Optional[str] = None
+
+class CollectionCreate(BaseModel):
+    name: str
+    is_auto: bool = False
+
+class CollectionUpdate(BaseModel):
+    name: str
+
+class CollectionResponse(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    item_count: int = 0
+    created_at: datetime
+    is_auto: bool = False
+
+class MetadataResponse(BaseModel):
+    title: str
+    thumbnail_url: Optional[str] = None
+    platform: str
+    content_type: str
+    suggested_tags: List[str] = []
+
+# New models for AI features
+class UserPreferences(BaseModel):
+    save_types: List[str] = []  # startup_ideas, content_inspiration, etc.
+    usage_goals: List[str] = []  # organize_ideas, second_brain, etc.
+    onboarding_completed: bool = False
+
+class InsightsResponse(BaseModel):
+    total_items: int
+    items_this_week: int
+    top_platforms: List[Dict[str, Any]]
+    top_tags: List[Dict[str, Any]]
+    collections_count: int
+    weekly_summary: Optional[str] = None
+    resurfaced_items: List[Dict[str, Any]] = []
+
+class AISummaryRequest(BaseModel):
+    item_id: str
+
+class AutoCollectionSuggestion(BaseModel):
+    collection_name: str
+    reason: str
+    is_new: bool = True
+    existing_collection_id: Optional[str] = None
+
+class UpdateProfileRequest(BaseModel):
+    username: Optional[str] = Field(None, min_length=3, max_length=20)
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class PushTokenRequest(BaseModel):
+    push_token: str
+
+
+# ============== Auth Helpers ==============
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def create_access_token(user_id: str) -> str:
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    payload = {"sub": user_id, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        user = await db.users.find_one({"id": user_id})
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except (jwt.PyJWTError, jwt.DecodeError, jwt.InvalidTokenError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ============== URL Metadata Extraction ==============
+
+def detect_platform(url: str) -> tuple:
+    """Detect platform and content type from URL"""
+    domain = urlparse(url).netloc.lower()
+    
+    platform_map = {
+        'youtube.com': ('YouTube', 'video'),
+        'youtu.be': ('YouTube', 'video'),
+        'twitter.com': ('X', 'post'),
+        'x.com': ('X', 'post'),
+        'instagram.com': ('Instagram', 'post'),
+        'tiktok.com': ('TikTok', 'video'),
+        'linkedin.com': ('LinkedIn', 'post'),
+        'medium.com': ('Medium', 'article'),
+        'reddit.com': ('Reddit', 'post'),
+        'github.com': ('GitHub', 'article'),
+        'substack.com': ('Substack', 'article'),
+    }
+    
+    for key, value in platform_map.items():
+        if key in domain:
+            return value
+    
+    return ('Web', 'article')
+
+def extract_suggested_tags(title: str) -> List[str]:
+    """Extract suggested tags from title keywords"""
+    if not title:
+        return []
+    
+    # Common stop words to filter out
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'it', 'this', 'that', 'how', 'what', 'why', 'when', 'where', 'who'}
+    
+    # Extract words and filter
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', title.lower())
+    tags = [word for word in words if word not in stop_words][:5]
+    
+    return list(set(tags))
+
+async def fetch_url_metadata(url: str) -> dict:
+    """Fetch metadata from URL using OpenGraph tags"""
+    platform, content_type = detect_platform(url)
+    
+    default_result = {
+        "title": url,
+        "thumbnail_url": None,
+        "platform": platform,
+        "content_type": content_type,
+        "suggested_tags": []
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = await client.get(url, headers=headers)
+            
+            if response.status_code != 200:
+                return default_result
+            
+            soup = BeautifulSoup(response.text, 'lxml')
+            
+            # Extract title
+            title = None
+            og_title = soup.find('meta', property='og:title')
+            if og_title and og_title.get('content'):
+                title = og_title['content']
+            elif soup.title:
+                title = soup.title.string
+            
+            if not title:
+                title = url
+            
+            # Extract thumbnail
+            thumbnail = None
+            og_image = soup.find('meta', property='og:image')
+            if og_image and og_image.get('content'):
+                thumbnail = og_image['content']
+            
+            # Extract suggested tags
+            suggested_tags = extract_suggested_tags(title)
+            
+            return {
+                "title": title.strip()[:200] if title else url,
+                "thumbnail_url": thumbnail,
+                "platform": platform,
+                "content_type": content_type,
+                "suggested_tags": suggested_tags
+            }
+    except Exception as e:
+        logger.error(f"Error fetching metadata: {e}")
+        return default_result
+
+# ============== Auth Routes ==============
+
+@api_router.post("/auth/register", response_model=TokenResponse)
+async def register(user_data: UserCreate):
+    # Check if user exists
+    existing = await db.users.find_one({"email": user_data.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Create user
+    user_id = str(uuid.uuid4())
+    user = {
+        "id": user_id,
+        "email": user_data.email.lower(),
+        "password": hash_password(user_data.password),
+        "name": user_data.name or user_data.email.split('@')[0],
+        "plan_type": "free",
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.users.insert_one(user)
+    
+    token = create_access_token(user_id)
+    
+    return TokenResponse(
+        access_token=token,
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user["name"],
+            plan_type=user["plan_type"],
+            created_at=user["created_at"]
+        )
+    )
+
+@api_router.post("/auth/login", response_model=TokenResponse)
+async def login(credentials: UserLogin):
+    user = await db.users.find_one({"email": credentials.email.lower()})
+    
+    if not user or not verify_password(credentials.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    token = create_access_token(user["id"])
+    
+    return TokenResponse(
+        access_token=token,
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user.get("name"),
+            username=user.get("username"),
+            avatar_url=user.get("avatar_url"),
+            plan_type=user.get("plan_type", "free"),
+            created_at=user["created_at"]
+        )
+
+    )
+
+
+@api_router.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: dict = Depends(get_current_user)):
+    return UserResponse(
+        id=current_user["id"],
+        email=current_user["email"],
+        name=current_user.get("name"),
+        username=current_user.get("username"),
+        avatar_url=current_user.get("avatar_url"),
+        plan_type=current_user.get("plan_type", "free"),
+        is_pro=current_user.get("is_pro", False),
+        pro_expires_at=current_user.get("pro_expires_at"),
+        push_token=current_user.get("push_token"),
+        notifications_enabled=current_user.get("notifications_enabled", False),
+        notification_prefs=current_user.get("notification_prefs"),
+        created_at=current_user["created_at"]
+    )
+
+
+
+# ============== URL Metadata Route ==============
+
+@api_router.post("/extract-metadata", response_model=MetadataResponse)
+async def extract_metadata(data: dict, current_user: dict = Depends(get_current_user)):
+    url = data.get("url", "")
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    
+    metadata = await fetch_url_metadata(url)
+    return MetadataResponse(**metadata)
+
+# ============== Saved Items Routes ==============
+
+@api_router.post("/items", response_model=SavedItemResponse)
+async def create_item(item_data: SavedItemCreate, current_user: dict = Depends(get_current_user)):
+    # Fetch metadata if not provided
+    if not item_data.title or not item_data.platform:
+        metadata = await fetch_url_metadata(item_data.url)
+        if not item_data.title:
+            item_data.title = metadata["title"]
+        if not item_data.platform:
+            item_data.platform = metadata["platform"]
+        if not item_data.content_type:
+            item_data.content_type = metadata["content_type"]
+        if not item_data.thumbnail_url:
+            item_data.thumbnail_url = metadata["thumbnail_url"]
+    
+    item_id = str(uuid.uuid4())
+    item = {
+        "id": item_id,
+        "user_id": current_user["id"],
+        "url": item_data.url,
+        "title": item_data.title or item_data.url,
+        "thumbnail_url": item_data.thumbnail_url,
+        "platform": item_data.platform or "Web",
+        "content_type": item_data.content_type or "article",
+        "notes": item_data.notes or "",
+        "tags": item_data.tags or [],
+        "collections": item_data.collections or [],
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.items.insert_one(item)
+    
+    return SavedItemResponse(**item)
+
+@api_router.get("/items", response_model=List[SavedItemResponse])
+async def get_items(
+    sort: str = "newest",
+    platform: Optional[str] = None,
+    collection: Optional[str] = None,
+    tag: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    query = {"user_id": current_user["id"]}
+    
+    if platform:
+        query["platform"] = platform
+    if collection:
+        query["collections"] = collection
+    if tag:
+        query["tags"] = tag
+    
+    sort_order = -1 if sort == "newest" else 1
+    
+    items = await db.items.find(query).sort("created_at", sort_order).to_list(1000)
+    return [SavedItemResponse(**item) for item in items]
+
+@api_router.get("/items/{item_id}", response_model=SavedItemResponse)
+async def get_item(item_id: str, current_user: dict = Depends(get_current_user)):
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return SavedItemResponse(**item)
+
+@api_router.put("/items/{item_id}", response_model=SavedItemResponse)
+async def update_item(item_id: str, update_data: SavedItemUpdate, current_user: dict = Depends(get_current_user)):
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
+    
+    if update_dict:
+        await db.items.update_one({"id": item_id}, {"$set": update_dict})
+    
+    updated_item = await db.items.find_one({"id": item_id})
+    return SavedItemResponse(**updated_item)
+
+@api_router.delete("/items/{item_id}")
+async def delete_item(item_id: str, current_user: dict = Depends(get_current_user)):
+    result = await db.items.delete_one({"id": item_id, "user_id": current_user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"message": "Item deleted"}
+
+# ============== Collections Routes ==============
+
+@api_router.post("/collections", response_model=CollectionResponse)
+async def create_collection(data: CollectionCreate, current_user: dict = Depends(get_current_user)):
+    # Check collection limit for free users
+    if current_user.get("plan_type", "free") == "free":
+        count = await db.collections.count_documents({"user_id": current_user["id"]})
+        if count >= 5:
+            raise HTTPException(status_code=403, detail="Free plan limited to 5 collections. Upgrade to Pro for unlimited.")
+    
+    collection_id = str(uuid.uuid4())
+    collection = {
+        "id": collection_id,
+        "user_id": current_user["id"],
+        "name": data.name,
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.collections.insert_one(collection)
+    
+    return CollectionResponse(**collection, item_count=0)
+
+@api_router.get("/collections", response_model=List[CollectionResponse])
+async def get_collections(current_user: dict = Depends(get_current_user)):
+    collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
+    
+    result = []
+    for col in collections:
+        item_count = await db.items.count_documents({
+            "user_id": current_user["id"],
+            "collections": col["id"]
+        })
+        result.append(CollectionResponse(**col, item_count=item_count))
+    
+    return result
+
+@api_router.put("/collections/{collection_id}", response_model=CollectionResponse)
+async def update_collection(collection_id: str, data: CollectionUpdate, current_user: dict = Depends(get_current_user)):
+    collection = await db.collections.find_one({"id": collection_id, "user_id": current_user["id"]})
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    
+    await db.collections.update_one({"id": collection_id}, {"$set": {"name": data.name}})
+    
+    updated = await db.collections.find_one({"id": collection_id})
+    item_count = await db.items.count_documents({
+        "user_id": current_user["id"],
+        "collections": collection_id
+    })
+    
+    return CollectionResponse(**updated, item_count=item_count)
+
+@api_router.delete("/collections/{collection_id}")
+async def delete_collection(collection_id: str, current_user: dict = Depends(get_current_user)):
+    result = await db.collections.delete_one({"id": collection_id, "user_id": current_user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    
+    # Remove collection from all items
+    await db.items.update_many(
+        {"user_id": current_user["id"], "collections": collection_id},
+        {"$pull": {"collections": collection_id}}
+    )
+    
+    return {"message": "Collection deleted"}
+
+# ============== Search Route ==============
+
+@api_router.get("/search", response_model=List[SavedItemResponse])
+async def search_items(q: str, current_user: dict = Depends(get_current_user)):
+    if not q or len(q) < 2:
+        return []
+    
+    # Create text search query
+    query = {
+        "user_id": current_user["id"],
+        "$or": [
+            {"title": {"$regex": q, "$options": "i"}},
+            {"notes": {"$regex": q, "$options": "i"}},
+            {"tags": {"$regex": q, "$options": "i"}},
+            {"platform": {"$regex": q, "$options": "i"}},
+            {"url": {"$regex": q, "$options": "i"}}
+        ]
+    }
+    
+    items = await db.items.find(query).sort("created_at", -1).to_list(100)
+    return [SavedItemResponse(**item) for item in items]
+
+# ============== Tags Route ==============
+
+@api_router.get("/tags", response_model=List[str])
+async def get_all_tags(current_user: dict = Depends(get_current_user)):
+    """Get all unique tags for the user"""
+    pipeline = [
+        {"$match": {"user_id": current_user["id"]}},
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags"}},
+        {"$sort": {"_id": 1}}
+    ]
+    
+    result = await db.items.aggregate(pipeline).to_list(100)
+    return [r["_id"] for r in result]
+
+# ============== AI Features ==============
+
+# Platform to auto-collection mapping
+PLATFORM_COLLECTIONS = {
+    'YouTube': 'Videos',
+    'TikTok': 'Videos',
+    'Instagram': 'Social',
+    'X': 'Social',
+    'LinkedIn': 'Professional',
+    'Medium': 'Articles',
+    'Substack': 'Articles',
+    'Reddit': 'Discussions',
+    'GitHub': 'Tech & Code',
+    'Web': 'Web Saves'
+}
+
+async def generate_ai_summary(title: str, url: str, platform: str) -> List[str]:
+    """Generate AI summary using GPT-4"""
+    try:
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return []
+        
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"summary-{uuid.uuid4()}",
+            system_message="You are a helpful assistant that creates concise bullet-point summaries. Always respond with exactly 3-5 bullet points, each starting with '•'. Keep each point under 15 words."
+        ).with_model("openai", "gpt-4")
+        
+        user_message = UserMessage(
+            text=f"Create a brief summary of this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}\n\nProvide 3-5 key bullet points about what this content likely covers based on the title."
+        )
+        
+        response = await chat.send_message(user_message)
+        
+        # Parse bullet points from response
+        lines = response.strip().split('\n')
+        bullets = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith('•') or line.startswith('-') or line.startswith('*'):
+                bullet = line.lstrip('•-* ').strip()
+                if bullet:
+                    bullets.append(bullet)
+        
+        return bullets[:5] if bullets else []
+    except Exception as e:
+        logger.error(f"AI summary error: {e}")
+        return []
+
+async def suggest_auto_collection(title: str, platform: str, user_id: str) -> Optional[Dict]:
+    """Suggest auto-collection based on platform and AI analysis"""
+    try:
+        # First try platform-based suggestion
+        platform_collection = PLATFORM_COLLECTIONS.get(platform, 'General')
+        
+        # Check if user has this collection
+        existing = await db.collections.find_one({
+            "user_id": user_id,
+            "name": platform_collection
+        })
+        
+        if existing:
+            return {
+                "collection_name": platform_collection,
+                "reason": f"Based on {platform} content",
+                "is_new": False,
+                "existing_collection_id": existing["id"]
+            }
+        
+        # Try AI-based suggestion for more specific categorization
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if api_key:
+            chat = LlmChat(
+                api_key=api_key,
+                session_id=f"collection-{uuid.uuid4()}",
+                system_message="You are a content organizer. Suggest ONE collection name (2-3 words max) for organizing content. Just respond with the collection name, nothing else."
+            ).with_model("openai", "gpt-4")
+            
+            user_message = UserMessage(
+                text=f"Suggest a collection name for: '{title}' from {platform}"
+            )
+            
+            response = await chat.send_message(user_message)
+            ai_suggestion = response.strip().strip('"\'')
+            
+            if ai_suggestion and len(ai_suggestion) < 30:
+                # Check if this collection exists
+                existing_ai = await db.collections.find_one({
+                    "user_id": user_id,
+                    "name": {"$regex": f"^{ai_suggestion}$", "$options": "i"}
+                })
+                
+                if existing_ai:
+                    return {
+                        "collection_name": existing_ai["name"],
+                        "reason": f"AI suggested based on content",
+                        "is_new": False,
+                        "existing_collection_id": existing_ai["id"]
+                    }
+                
+                return {
+                    "collection_name": ai_suggestion,
+                    "reason": f"AI suggested based on content",
+                    "is_new": True,
+                    "existing_collection_id": None
+                }
+        
+        return {
+            "collection_name": platform_collection,
+            "reason": f"Based on {platform} content",
+            "is_new": True,
+            "existing_collection_id": None
+        }
+    except Exception as e:
+        logger.error(f"Auto-collection suggestion error: {e}")
+        return None
+
+async def generate_weekly_summary(user_id: str, items: List[dict]) -> Optional[str]:
+    """Generate weekly digest summary"""
+    try:
+        if not items:
+            return None
+        
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return None
+        
+        # Prepare items summary
+        items_text = "\n".join([f"- {item.get('title', 'Untitled')} ({item.get('platform', 'Web')})" for item in items[:10]])
+        
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"digest-{uuid.uuid4()}",
+            system_message="You are a helpful assistant that creates brief, encouraging weekly summaries. Keep it under 50 words, friendly and motivational."
+        ).with_model("openai", "gpt-4")
+        
+        user_message = UserMessage(
+            text=f"Create a brief weekly summary for someone who saved these items:\n{items_text}\n\nMention the themes and encourage them to review their saves."
+        )
+        
+        response = await chat.send_message(user_message)
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Weekly summary error: {e}")
+        return None
+
+# ============== PREMIUM AI FEATURES ==============
+
+async def extract_ideas(title: str, url: str, platform: str) -> List[Dict[str, str]]:
+    """Extract key ideas and insights from content - PREMIUM FEATURE"""
+    try:
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return []
+        
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"ideas-{uuid.uuid4()}",
+            system_message="""You are an expert idea extractor. Analyze content and extract 3-5 key ideas or insights.
+For each idea, provide:
+1. A short title (3-5 words)
+2. A brief description (1 sentence)
+3. A category: "concept", "insight", "strategy", "quote", or "takeaway"
+
+Format your response as:
+IDEA: [title]
+DESC: [description]
+TYPE: [category]
+
+Repeat for each idea."""
+        ).with_model("openai", "gpt-4")
+        
+        user_message = UserMessage(
+            text=f"Extract key ideas from this content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}"
+        )
+        
+        response = await chat.send_message(user_message)
+        
+        # Parse ideas from response
+        ideas = []
+        current_idea = {}
+        
+        for line in response.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('IDEA:'):
+                if current_idea:
+                    ideas.append(current_idea)
+                current_idea = {"title": line[5:].strip()}
+            elif line.startswith('DESC:'):
+                current_idea["description"] = line[5:].strip()
+            elif line.startswith('TYPE:'):
+                current_idea["type"] = line[5:].strip().lower()
+        
+        if current_idea and "title" in current_idea:
+            ideas.append(current_idea)
+        
+        return ideas[:5]
+    except Exception as e:
+        logger.error(f"Idea extraction error: {e}")
+        return []
+
+async def generate_smart_tags(title: str, url: str, platform: str, existing_tags: List[str] = None) -> List[Dict[str, Any]]:
+    """Generate smart tag suggestions with clustering - PREMIUM FEATURE"""
+    try:
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return []
+        
+        existing_str = ", ".join(existing_tags) if existing_tags else "none"
+        
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"tags-{uuid.uuid4()}",
+            system_message="""You are a content tagging expert. Suggest 5-7 relevant tags for content organization.
+Consider:
+- Topic/subject matter
+- Content type (tutorial, review, news, etc.)
+- Industry/domain
+- Skill level (beginner, advanced, etc.)
+- Action type (read, watch, implement, etc.)
+
+For each tag, indicate confidence (high, medium, low) and cluster/category.
+
+Format:
+TAG: [tag_name] | CONFIDENCE: [high/medium/low] | CLUSTER: [category]"""
+        ).with_model("openai", "gpt-4")
+        
+        user_message = UserMessage(
+            text=f"Suggest smart tags for:\nTitle: {title}\nPlatform: {platform}\nExisting tags: {existing_str}"
+        )
+        
+        response = await chat.send_message(user_message)
+        
+        # Parse tags
+        tags = []
+        for line in response.strip().split('\n'):
+            if line.startswith('TAG:'):
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    tag_name = parts[0].replace('TAG:', '').strip()
+                    confidence = parts[1].replace('CONFIDENCE:', '').strip().lower()
+                    cluster = parts[2].replace('CLUSTER:', '').strip()
+                    tags.append({
+                        "name": tag_name,
+                        "confidence": confidence,
+                        "cluster": cluster,
+                        "is_new": tag_name.lower() not in [t.lower() for t in (existing_tags or [])]
+                    })
+        
+        return tags[:7]
+    except Exception as e:
+        logger.error(f"Smart tags error: {e}")
+        return []
+
+async def generate_action_items(title: str, url: str, platform: str, notes: str = "") -> List[Dict[str, Any]]:
+    """Turn saved content into actionable tasks - PREMIUM FEATURE"""
+    try:
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return []
+        
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"actions-{uuid.uuid4()}",
+            system_message="""You are a productivity expert. Convert saved content into 3-5 specific, actionable tasks.
+Each action should be:
+- Concrete and specific
+- Achievable in a reasonable timeframe
+- Relevant to the content
+
+Format each action as:
+ACTION: [task description]
+PRIORITY: [high/medium/low]
+TIME: [estimated time: 5min/15min/30min/1hr/2hr+]
+CATEGORY: [learn/create/share/implement/review]"""
+        ).with_model("openai", "gpt-4")
+        
+        notes_str = f"\nUser notes: {notes}" if notes else ""
+        
+        user_message = UserMessage(
+            text=f"Generate action items from this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}{notes_str}"
+        )
+        
+        response = await chat.send_message(user_message)
+        
+        # Parse action items
+        actions = []
+        current_action = {}
+        
+        for line in response.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('ACTION:'):
+                if current_action and "task" in current_action:
+                    actions.append(current_action)
+                current_action = {"task": line[7:].strip(), "completed": False}
+            elif line.startswith('PRIORITY:'):
+                current_action["priority"] = line[9:].strip().lower()
+            elif line.startswith('TIME:'):
+                current_action["estimated_time"] = line[5:].strip()
+            elif line.startswith('CATEGORY:'):
+                current_action["category"] = line[9:].strip().lower()
+        
+        if current_action and "task" in current_action:
+            actions.append(current_action)
+        
+        return actions[:5]
+    except Exception as e:
+        logger.error(f"Action items error: {e}")
+        return []
+
+# ============== AI Endpoints ==============
+
+@api_router.post("/items/{item_id}/ai-summary")
+async def generate_item_summary(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate AI summary for an item"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    summary = await generate_ai_summary(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
+    
+    if summary:
+        await db.items.update_one({"id": item_id}, {"$set": {"ai_summary": summary}})
+    
+    return {"summary": summary}
+
+@api_router.post("/items/{item_id}/extract-ideas")
+async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Extract key ideas from an item - PREMIUM FEATURE"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
+    
+    if ideas:
+        await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
+    
+    return {"ideas": ideas}
+
+@api_router.post("/items/{item_id}/smart-tags")
+async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate smart tag suggestions - PREMIUM FEATURE"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    tags = await generate_smart_tags(
+        item.get("title", ""), 
+        item.get("url", ""), 
+        item.get("platform", "Web"),
+        item.get("tags", [])
+    )
+    
+    return {"suggested_tags": tags}
+
+@api_router.post("/items/{item_id}/action-items")
+async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate action items from content - PREMIUM FEATURE"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    actions = await generate_action_items(
+        item.get("title", ""), 
+        item.get("url", ""), 
+        item.get("platform", "Web"),
+        item.get("notes", "")
+    )
+    
+    if actions:
+        await db.items.update_one({"id": item_id}, {"$set": {"action_items": actions}})
+    
+    return {"action_items": actions}
+
+@api_router.put("/items/{item_id}/action-items/{action_index}/toggle")
+async def toggle_action_item(item_id: str, action_index: int, current_user: dict = Depends(get_current_user)):
+    """Toggle action item completion status"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    action_items = item.get("action_items", [])
+    if action_index < 0 or action_index >= len(action_items):
+        raise HTTPException(status_code=400, detail="Invalid action index")
+    
+    action_items[action_index]["completed"] = not action_items[action_index].get("completed", False)
+    await db.items.update_one({"id": item_id}, {"$set": {"action_items": action_items}})
+    
+    return {"action_items": action_items}
+
+@api_router.post("/items/{item_id}/apply-smart-tag")
+async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depends(get_current_user)):
+    """Apply a suggested smart tag to an item"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    current_tags = item.get("tags", [])
+    if tag_name not in current_tags:
+        current_tags.append(tag_name)
+        await db.items.update_one({"id": item_id}, {"$set": {"tags": current_tags}})
+    
+    return {"tags": current_tags}
+
+@api_router.get("/items/{item_id}/suggest-collection")
+async def get_collection_suggestion(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Get AI collection suggestion for an item"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    suggestion = await suggest_auto_collection(
+        item.get("title", ""),
+        item.get("platform", "Web"),
+        current_user["id"]
+    )
+    
+    return suggestion or {"collection_name": "General", "reason": "Default suggestion", "is_new": True}
+
+@api_router.get("/insights", response_model=InsightsResponse)
+async def get_insights(current_user: dict = Depends(get_current_user)):
+    """Get user insights and weekly digest"""
+    user_id = current_user["id"]
+    
+    # Total items
+    total_items = await db.items.count_documents({"user_id": user_id})
+    
+    # Items this week
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    items_this_week = await db.items.count_documents({
+        "user_id": user_id,
+        "created_at": {"$gte": week_ago}
+    })
+    
+    # Top platforms
+    platform_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {"_id": "$platform", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5}
+    ]
+    top_platforms = await db.items.aggregate(platform_pipeline).to_list(5)
+    
+    # Top tags
+    tags_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5}
+    ]
+    top_tags = await db.items.aggregate(tags_pipeline).to_list(5)
+    
+    # Collections count
+    collections_count = await db.collections.count_documents({"user_id": user_id})
+    
+    # Resurfaced items (saved 30+ days ago)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    old_items = await db.items.find({
+        "user_id": user_id,
+        "created_at": {"$lte": thirty_days_ago}
+    }).sort("created_at", 1).limit(3).to_list(3)
+    
+    resurfaced = []
+    for item in old_items:
+        days_ago = (datetime.utcnow() - item["created_at"]).days
+        resurfaced.append({
+            "id": item["id"],
+            "title": item.get("title", "Untitled"),
+            "thumbnail_url": item.get("thumbnail_url"),
+            "platform": item.get("platform", "Web"),
+            "days_ago": days_ago,
+            "message": f"You saved this {days_ago} days ago"
+        })
+    
+    # Generate weekly summary
+    recent_items = await db.items.find({
+        "user_id": user_id,
+        "created_at": {"$gte": week_ago}
+    }).to_list(10)
+    
+    weekly_summary = await generate_weekly_summary(user_id, recent_items)
+    
+    return InsightsResponse(
+        total_items=total_items,
+        items_this_week=items_this_week,
+        top_platforms=[{"platform": p["_id"], "count": p["count"]} for p in top_platforms],
+        top_tags=[{"tag": t["_id"], "count": t["count"]} for t in top_tags],
+        collections_count=collections_count,
+        weekly_summary=weekly_summary,
+        resurfaced_items=resurfaced
+    )
+
+@api_router.get("/resurfaced")
+async def get_resurfaced_items(current_user: dict = Depends(get_current_user)):
+    """Get items to resurface (saved 30+ days ago)"""
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    
+    items = await db.items.find({
+        "user_id": current_user["id"],
+        "created_at": {"$lte": thirty_days_ago}
+    }).sort("created_at", 1).limit(5).to_list(5)
+    
+    result = []
+    for item in items:
+        days_ago = (datetime.utcnow() - item["created_at"]).days
+        result.append({
+            **SavedItemResponse(**item).dict(),
+            "days_ago": days_ago,
+            "resurface_message": f"You saved this {days_ago} days ago"
+        })
+    
+    return result
+
+# ============User Settings===========
+@api_router.put("/users/change-password")
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    if not verify_password(data.current_password, current_user["password"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Current password is incorrect"
+        )
+
+    if verify_password(data.new_password, current_user["password"]):
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from current password"
+        )
+
+    new_hashed = hash_password(data.new_password)
+
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {"password": new_hashed}}
+    )
+
+    return {"message": "Password updated successfully"}
+
+
+@api_router.delete("/users/me")
+async def delete_account(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+
+    # Delete user-related data
+    await db.items.delete_many({"user_id": user_id})
+    await db.collections.delete_many({"user_id": user_id})
+
+    # Delete user
+    result = await db.users.delete_one({"id": user_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "Account deleted successfully"}
+
+
+@api_router.put("/users/profile")
+async def update_profile(
+    data: UpdateProfileRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    update_data = {}
+
+    # Username uniqueness check
+    if data.username:
+        existing = await db.users.find_one({
+            "username": data.username.lower(),
+            "id": {"$ne": current_user["id"]}
+        })
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Username already taken"
+            )
+        update_data["username"] = data.username.lower()
+
+    if data.name is not None:
+        update_data["name"] = data.name
+
+    if data.avatar_url is not None:
+        update_data["avatar_url"] = data.avatar_url
+
+    if not update_data:
+        return {"message": "No changes provided"}
+
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": update_data}
+    )
+
+    updated_user = await db.users.find_one({"id": current_user["id"]})
+
+    return {
+        "message": "Profile updated",
+        "user": {
+            "id": updated_user["id"],
+            "email": updated_user["email"],
+            "name": updated_user.get("name"),
+            "username": updated_user.get("username"),
+            "avatar_url": updated_user.get("avatar_url"),
+            "plan_type": updated_user.get("plan_type"),
+            "created_at": updated_user["created_at"],
+        }
+    }
+
+
+@api_router.post("/users/push-token")
+async def save_push_token(
+    data: PushTokenRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "push_token": data.push_token,
+            "notifications_enabled": True,
+            "notification_prefs": {
+                "weekly_review": True,
+                "pending_actions": True,
+                "resurface": True
+            }
+        }}
+    )
+    return {"message": "Push token saved"}
+
+
+@api_router.get("/users/notifications")
+async def get_notification_settings(current_user: dict = Depends(get_current_user)):
+    return {
+        "notifications_enabled": current_user.get("notifications_enabled", False),
+        "notification_prefs": current_user.get("notification_prefs", {
+            "weekly_review": True,
+            "pending_actions": True,
+            "resurface": True
+        })
+    }
+
+
+
+
+
+
+
+
+# ============== User Preferences ==============
+
+@api_router.put("/users/preferences")
+async def update_preferences(preferences: UserPreferences, current_user: dict = Depends(get_current_user)):
+    """Update user preferences from onboarding"""
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "preferences": preferences.dict(),
+            "onboarding_completed": preferences.onboarding_completed
+        }}
+    )
+    return {"message": "Preferences updated"}
+
+@api_router.get("/users/preferences")
+async def get_preferences(current_user: dict = Depends(get_current_user)):
+    """Get user preferences"""
+    user = await db.users.find_one({"id": current_user["id"]})
+    return user.get("preferences", {
+        "save_types": [],
+        "usage_goals": [],
+        "onboarding_completed": False
+    })
+
+# ============== Pro Subscription ==============
+
+@api_router.get("/users/plan")
+async def get_user_plan(current_user: dict = Depends(get_current_user)):
+    """Get user's current plan and limits"""
+    user = await db.users.find_one({"id": current_user["id"]})
+    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
+    
+    # Count current usage
+    items_count = await db.items.count_documents({"user_id": current_user["id"]})
+    collections_count = await db.collections.count_documents({"user_id": current_user["id"]})
+    
+    limits = get_user_limits(user)
+    
+    return {
+        "plan_type": "pro" if is_pro else "free",
+        "is_pro": is_pro,
+        "pro_expires_at": user.get("pro_expires_at"),
+        "limits": limits,
+        "usage": {
+            "items_count": items_count,
+            "collections_count": collections_count,
+            "items_limit": limits["max_items"],
+            "collections_limit": limits["max_collections"],
+        },
+        "features": {
+            "unlimited_collections": is_pro,
+            "advanced_search": is_pro,
+            "smart_reminders": is_pro,
+            "vault_export": is_pro,
+            "ai_features": is_pro,
+        }
+    }
+
+@api_router.post("/users/upgrade-pro")
+async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
+    """Upgrade user to Pro plan (simulated - in production use payment provider)"""
+    # In production, this would integrate with Stripe/RevenueCat
+    # For now, we'll simulate the upgrade
+    pro_expires_at = datetime.utcnow() + timedelta(days=30)  # 30-day subscription
+    
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "is_pro": True,
+            "plan_type": "pro",
+            "pro_expires_at": pro_expires_at
+        }}
+    )
+    
+    return {
+        "message": "Successfully upgraded to Pro!",
+        "plan_type": "pro",
+        "pro_expires_at": pro_expires_at
+    }
+
+@api_router.post("/users/cancel-pro")
+async def cancel_pro(current_user: dict = Depends(get_current_user)):
+    """Cancel Pro subscription"""
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "is_pro": False,
+            "plan_type": "free",
+            "pro_expires_at": None
+        }}
+    )
+    
+    return {"message": "Pro subscription cancelled", "plan_type": "free"}
+
+# ============== Advanced Search (Pro Feature) ==============
+
+@api_router.get("/search/advanced")
+async def advanced_search(
+    q: str,
+    search_notes: bool = True,
+    search_tags: bool = True,
+    search_titles: bool = True,
+    platform: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Advanced search with notes & tags - PRO FEATURE"""
+    user = await db.users.find_one({"id": current_user["id"]})
+    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
+    
+    if not is_pro:
+        raise HTTPException(
+            status_code=403, 
+            detail="Advanced search is a Pro feature. Upgrade to unlock."
+        )
+    
+    # Build search query
+    search_conditions = []
+    
+    if search_titles:
+        search_conditions.append({"title": {"$regex": q, "$options": "i"}})
+    if search_notes:
+        search_conditions.append({"notes": {"$regex": q, "$options": "i"}})
+    if search_tags:
+        search_conditions.append({"tags": {"$regex": q, "$options": "i"}})
+    
+    query = {
+        "user_id": current_user["id"],
+        "$or": search_conditions
+    }
+    
+    if platform:
+        query["platform"] = platform
+    if collection_id:
+        query["collections"] = collection_id
+    
+    items = await db.items.find(query).sort("created_at", -1).to_list(100)
+    
+    return {
+        "results": [SavedItemResponse(**item) for item in items],
+        "total": len(items),
+        "search_in": {
+            "titles": search_titles,
+            "notes": search_notes,
+            "tags": search_tags
+        }
+    }
+
+# ============== Vault Export (Pro Feature) ==============
+
+@api_router.get("/export/vault")
+async def export_vault(current_user: dict = Depends(get_current_user)):
+    """Export all user data - PRO FEATURE"""
+    user = await db.users.find_one({"id": current_user["id"]})
+    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
+    
+    if not is_pro:
+        raise HTTPException(
+            status_code=403, 
+            detail="Vault export is a Pro feature. Upgrade to unlock."
+        )
+    
+    # Get all user data
+    items = await db.items.find({"user_id": current_user["id"]}).to_list(1000)
+    collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
+    
+    # Prepare export data
+    export_data = {
+        "exported_at": datetime.utcnow().isoformat(),
+        "user": {
+            "email": user.get("email"),
+            "name": user.get("name"),
+            "created_at": user.get("created_at").isoformat() if user.get("created_at") else None,
+        },
+        "statistics": {
+            "total_items": len(items),
+            "total_collections": len(collections),
+        },
+        "collections": [
+            {
+                "id": c["id"],
+                "name": c["name"],
+                "created_at": c["created_at"].isoformat() if c.get("created_at") else None,
+            }
+            for c in collections
+        ],
+        "items": [
+            {
+                "id": item["id"],
+                "url": item.get("url"),
+                "title": item.get("title"),
+                "platform": item.get("platform"),
+                "notes": item.get("notes"),
+                "tags": item.get("tags", []),
+                "collections": item.get("collections", []),
+                "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
+                "ai_summary": item.get("ai_summary"),
+                "action_items": item.get("action_items"),
+            }
+            for item in items
+        ]
+    }
+    
+    return export_data
+
+# ============== Smart Reminders (Pro Feature) ==============
+
+@api_router.get("/reminders")
+async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
+    """Get smart resurfacing reminders - PRO FEATURE"""
+    user = await db.users.find_one({"id": current_user["id"]})
+    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
+    
+    if not is_pro:
+        raise HTTPException(
+            status_code=403, 
+            detail="Smart reminders is a Pro feature. Upgrade to unlock."
+        )
+    
+    reminders = []
+    
+    # Items saved 7 days ago (weekly review)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    week_ago_start = week_ago.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago_end = week_ago.replace(hour=23, minute=59, second=59, microsecond=999999)
+    
+    weekly_items = await db.items.find({
+        "user_id": current_user["id"],
+        "created_at": {"$gte": week_ago_start, "$lte": week_ago_end}
+    }).to_list(5)
+    
+    if weekly_items:
+        reminders.append({
+            "type": "weekly_review",
+            "title": "Weekly Review",
+            "message": f"You saved {len(weekly_items)} items exactly a week ago. Time to review!",
+            "items": [{"id": i["id"], "title": i.get("title", "Untitled")} for i in weekly_items],
+            "priority": "medium"
+        })
+    
+    # Items with incomplete action items
+    items_with_actions = await db.items.find({
+        "user_id": current_user["id"],
+        "action_items": {"$exists": True, "$ne": []},
+    }).to_list(100)
+    
+    incomplete_actions = []
+    for item in items_with_actions:
+        actions = item.get("action_items", [])
+        incomplete = [a for a in actions if not a.get("completed", False)]
+        if incomplete:
+            incomplete_actions.append({
+                "item_id": item["id"],
+                "item_title": item.get("title", "Untitled"),
+                "pending_tasks": len(incomplete)
+            })
+    
+    if incomplete_actions:
+        reminders.append({
+            "type": "pending_actions",
+            "title": "Pending Action Items",
+            "message": f"You have pending tasks on {len(incomplete_actions)} saved items.",
+            "items": incomplete_actions[:5],
+            "priority": "high"
+        })
+    
+    # Items saved 30+ days ago (resurface)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    old_items = await db.items.find({
+        "user_id": current_user["id"],
+        "created_at": {"$lte": thirty_days_ago}
+    }).sort("created_at", 1).limit(5).to_list(5)
+    
+    if old_items:
+        reminders.append({
+            "type": "resurface",
+            "title": "Forgotten Gems",
+            "message": "These items from your vault might be worth revisiting.",
+            "items": [
+                {
+                    "id": i["id"], 
+                    "title": i.get("title", "Untitled"),
+                    "days_ago": (datetime.utcnow() - i["created_at"]).days
+                } 
+                for i in old_items
+            ],
+            "priority": "low"
+        })
+    
+    return {"reminders": reminders, "total": len(reminders)}
+
+# ============== Health Check ==============
+
+@api_router.get("/")
+async def root():
+    return {"message": "Stash API is running", "version": "1.0.0"}
+
+@api_router.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
