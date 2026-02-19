@@ -1020,18 +1020,11 @@ async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depe
 
 @api_router.get("/items/{item_id}/suggest-collection")
 async def get_collection_suggestion(item_id: str, current_user: dict = Depends(get_current_user)):
-    """Get AI collection suggestion for an item"""
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    
-    suggestion = await suggest_auto_collection(
-        item.get("title", ""),
-        item.get("platform", "Web"),
-        current_user["id"]
-    )
-    
-    return suggestion or {"collection_name": "General", "reason": "Default suggestion", "is_new": True}
+    return {
+        "collection_name": "General",
+        "reason": "AI disabled",
+        "is_new": True
+    }
 
 @api_router.get("/insights", response_model=InsightsResponse)
 async def get_insights(current_user: dict = Depends(get_current_user)):
@@ -1089,13 +1082,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
             "message": f"You saved this {days_ago} days ago"
         })
     
-    # Generate weekly summary
-    recent_items = await db.items.find({
-        "user_id": user_id,
-        "created_at": {"$gte": week_ago}
-    }).to_list(10)
     
-    # weekly_summary = await generate_weekly_summary(user_id, recent_items)
     weekly_summary = None  # Placeholder since AI function is commented out
     
     return InsightsResponse(
