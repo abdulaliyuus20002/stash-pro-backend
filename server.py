@@ -23,22 +23,15 @@ import random
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-client = None
-db = None
 
-def get_db():
-    global client, db
-    if client is None:
-        client = AsyncIOMotorClient(os.environ["MONGO_URL"])
-        db = client[os.environ.get("DB_NAME", "stash_db")]
-    return db
 
-db = get_db()
+mongo_url = os.environ.get("MONGO_URL")
+if not mongo_url:
+    raise RuntimeError("MONGO_URL environment variable is not set")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'stash_db')]
+db = client[os.environ.get("DB_NAME", "stash_db")]
+
 
 # JWT Configuration
 SECRET_KEY = os.environ.get('JWT_SECRET', 'stash-secret-key-change-in-production')
@@ -635,365 +628,365 @@ PLATFORM_COLLECTIONS = {
     'Web': 'Web Saves'
 }
 
-async def generate_ai_summary(title: str, url: str, platform: str) -> List[str]:
-    """Generate AI summary using GPT-4"""
-    try:
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return []
+# async def generate_ai_summary(title: str, url: str, platform: str) -> List[str]:
+#     """Generate AI summary using GPT-4"""
+#     try:
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if not api_key:
+#             return []
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"summary-{uuid.uuid4()}",
-            system_message="You are a helpful assistant that creates concise bullet-point summaries. Always respond with exactly 3-5 bullet points, each starting with '•'. Keep each point under 15 words."
-        ).with_model("openai", "gpt-4")
+#         chat = LlmChat(
+#             api_key=api_key,
+#             session_id=f"summary-{uuid.uuid4()}",
+#             system_message="You are a helpful assistant that creates concise bullet-point summaries. Always respond with exactly 3-5 bullet points, each starting with '•'. Keep each point under 15 words."
+#         ).with_model("openai", "gpt-4")
         
-        user_message = UserMessage(
-            text=f"Create a brief summary of this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}\n\nProvide 3-5 key bullet points about what this content likely covers based on the title."
-        )
+#         user_message = UserMessage(
+#             text=f"Create a brief summary of this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}\n\nProvide 3-5 key bullet points about what this content likely covers based on the title."
+#         )
         
-        response = await chat.send_message(user_message)
+#         response = await chat.send_message(user_message)
         
-        # Parse bullet points from response
-        lines = response.strip().split('\n')
-        bullets = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('•') or line.startswith('-') or line.startswith('*'):
-                bullet = line.lstrip('•-* ').strip()
-                if bullet:
-                    bullets.append(bullet)
+#         # Parse bullet points from response
+#         lines = response.strip().split('\n')
+#         bullets = []
+#         for line in lines:
+#             line = line.strip()
+#             if line.startswith('•') or line.startswith('-') or line.startswith('*'):
+#                 bullet = line.lstrip('•-* ').strip()
+#                 if bullet:
+#                     bullets.append(bullet)
         
-        return bullets[:5] if bullets else []
-    except Exception as e:
-        logger.error(f"AI summary error: {e}")
-        return []
+#         return bullets[:5] if bullets else []
+#     except Exception as e:
+#         logger.error(f"AI summary error: {e}")
+#         return []
 
-async def suggest_auto_collection(title: str, platform: str, user_id: str) -> Optional[Dict]:
-    """Suggest auto-collection based on platform and AI analysis"""
-    try:
-        # First try platform-based suggestion
-        platform_collection = PLATFORM_COLLECTIONS.get(platform, 'General')
+# async def suggest_auto_collection(title: str, platform: str, user_id: str) -> Optional[Dict]:
+#     """Suggest auto-collection based on platform and AI analysis"""
+#     try:
+#         # First try platform-based suggestion
+#         platform_collection = PLATFORM_COLLECTIONS.get(platform, 'General')
         
-        # Check if user has this collection
-        existing = await db.collections.find_one({
-            "user_id": user_id,
-            "name": platform_collection
-        })
+#         # Check if user has this collection
+#         existing = await db.collections.find_one({
+#             "user_id": user_id,
+#             "name": platform_collection
+#         })
         
-        if existing:
-            return {
-                "collection_name": platform_collection,
-                "reason": f"Based on {platform} content",
-                "is_new": False,
-                "existing_collection_id": existing["id"]
-            }
+#         if existing:
+#             return {
+#                 "collection_name": platform_collection,
+#                 "reason": f"Based on {platform} content",
+#                 "is_new": False,
+#                 "existing_collection_id": existing["id"]
+#             }
         
-        # Try AI-based suggestion for more specific categorization
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if api_key:
-            chat = LlmChat(
-                api_key=api_key,
-                session_id=f"collection-{uuid.uuid4()}",
-                system_message="You are a content organizer. Suggest ONE collection name (2-3 words max) for organizing content. Just respond with the collection name, nothing else."
-            ).with_model("openai", "gpt-4")
+#         # Try AI-based suggestion for more specific categorization
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if api_key:
+#             chat = LlmChat(
+#                 api_key=api_key,
+#                 session_id=f"collection-{uuid.uuid4()}",
+#                 system_message="You are a content organizer. Suggest ONE collection name (2-3 words max) for organizing content. Just respond with the collection name, nothing else."
+#             ).with_model("openai", "gpt-4")
             
-            user_message = UserMessage(
-                text=f"Suggest a collection name for: '{title}' from {platform}"
-            )
+#             user_message = UserMessage(
+#                 text=f"Suggest a collection name for: '{title}' from {platform}"
+#             )
             
-            response = await chat.send_message(user_message)
-            ai_suggestion = response.strip().strip('"\'')
+#             response = await chat.send_message(user_message)
+#             ai_suggestion = response.strip().strip('"\'')
             
-            if ai_suggestion and len(ai_suggestion) < 30:
-                # Check if this collection exists
-                existing_ai = await db.collections.find_one({
-                    "user_id": user_id,
-                    "name": {"$regex": f"^{ai_suggestion}$", "$options": "i"}
-                })
+#             if ai_suggestion and len(ai_suggestion) < 30:
+#                 # Check if this collection exists
+#                 existing_ai = await db.collections.find_one({
+#                     "user_id": user_id,
+#                     "name": {"$regex": f"^{ai_suggestion}$", "$options": "i"}
+#                 })
                 
-                if existing_ai:
-                    return {
-                        "collection_name": existing_ai["name"],
-                        "reason": f"AI suggested based on content",
-                        "is_new": False,
-                        "existing_collection_id": existing_ai["id"]
-                    }
+#                 if existing_ai:
+#                     return {
+#                         "collection_name": existing_ai["name"],
+#                         "reason": f"AI suggested based on content",
+#                         "is_new": False,
+#                         "existing_collection_id": existing_ai["id"]
+#                     }
                 
-                return {
-                    "collection_name": ai_suggestion,
-                    "reason": f"AI suggested based on content",
-                    "is_new": True,
-                    "existing_collection_id": None
-                }
+#                 return {
+#                     "collection_name": ai_suggestion,
+#                     "reason": f"AI suggested based on content",
+#                     "is_new": True,
+#                     "existing_collection_id": None
+#                 }
         
-        return {
-            "collection_name": platform_collection,
-            "reason": f"Based on {platform} content",
-            "is_new": True,
-            "existing_collection_id": None
-        }
-    except Exception as e:
-        logger.error(f"Auto-collection suggestion error: {e}")
-        return None
+#         return {
+#             "collection_name": platform_collection,
+#             "reason": f"Based on {platform} content",
+#             "is_new": True,
+#             "existing_collection_id": None
+#         }
+#     except Exception as e:
+#         logger.error(f"Auto-collection suggestion error: {e}")
+#         return None
 
-async def generate_weekly_summary(user_id: str, items: List[dict]) -> Optional[str]:
-    """Generate weekly digest summary"""
-    try:
-        if not items:
-            return None
+# async def generate_weekly_summary(user_id: str, items: List[dict]) -> Optional[str]:
+#     """Generate weekly digest summary"""
+#     try:
+#         if not items:
+#             return None
         
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return None
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if not api_key:
+#             return None
         
-        # Prepare items summary
-        items_text = "\n".join([f"- {item.get('title', 'Untitled')} ({item.get('platform', 'Web')})" for item in items[:10]])
+#         # Prepare items summary
+#         items_text = "\n".join([f"- {item.get('title', 'Untitled')} ({item.get('platform', 'Web')})" for item in items[:10]])
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"digest-{uuid.uuid4()}",
-            system_message="You are a helpful assistant that creates brief, encouraging weekly summaries. Keep it under 50 words, friendly and motivational."
-        ).with_model("openai", "gpt-4")
+#         chat = LlmChat(
+#             api_key=api_key,
+#             session_id=f"digest-{uuid.uuid4()}",
+#             system_message="You are a helpful assistant that creates brief, encouraging weekly summaries. Keep it under 50 words, friendly and motivational."
+#         ).with_model("openai", "gpt-4")
         
-        user_message = UserMessage(
-            text=f"Create a brief weekly summary for someone who saved these items:\n{items_text}\n\nMention the themes and encourage them to review their saves."
-        )
+#         user_message = UserMessage(
+#             text=f"Create a brief weekly summary for someone who saved these items:\n{items_text}\n\nMention the themes and encourage them to review their saves."
+#         )
         
-        response = await chat.send_message(user_message)
-        return response.strip()
-    except Exception as e:
-        logger.error(f"Weekly summary error: {e}")
-        return None
+#         response = await chat.send_message(user_message)
+#         return response.strip()
+#     except Exception as e:
+#         logger.error(f"Weekly summary error: {e}")
+#         return None
 
 # ============== PREMIUM AI FEATURES ==============
 
-async def extract_ideas(title: str, url: str, platform: str) -> List[Dict[str, str]]:
-    """Extract key ideas and insights from content - PREMIUM FEATURE"""
-    try:
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return []
+# async def extract_ideas(title: str, url: str, platform: str) -> List[Dict[str, str]]:
+#     """Extract key ideas and insights from content - PREMIUM FEATURE"""
+#     try:
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if not api_key:
+#             return []
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"ideas-{uuid.uuid4()}",
-            system_message="""You are an expert idea extractor. Analyze content and extract 3-5 key ideas or insights.
-For each idea, provide:
-1. A short title (3-5 words)
-2. A brief description (1 sentence)
-3. A category: "concept", "insight", "strategy", "quote", or "takeaway"
+#         chat = LlmChat(
+#             api_key=api_key,
+#             session_id=f"ideas-{uuid.uuid4()}",
+#             system_message="""You are an expert idea extractor. Analyze content and extract 3-5 key ideas or insights.
+# For each idea, provide:
+# 1. A short title (3-5 words)
+# 2. A brief description (1 sentence)
+# 3. A category: "concept", "insight", "strategy", "quote", or "takeaway"
 
-Format your response as:
-IDEA: [title]
-DESC: [description]
-TYPE: [category]
+# Format your response as:
+# IDEA: [title]
+# DESC: [description]
+# TYPE: [category]
 
-Repeat for each idea."""
-        ).with_model("openai", "gpt-4")
+# Repeat for each idea."""
+#         ).with_model("openai", "gpt-4")
         
-        user_message = UserMessage(
-            text=f"Extract key ideas from this content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}"
-        )
+#         user_message = UserMessage(
+#             text=f"Extract key ideas from this content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}"
+#         )
         
-        response = await chat.send_message(user_message)
+#         response = await chat.send_message(user_message)
         
-        # Parse ideas from response
-        ideas = []
-        current_idea = {}
+#         # Parse ideas from response
+#         ideas = []
+#         current_idea = {}
         
-        for line in response.strip().split('\n'):
-            line = line.strip()
-            if line.startswith('IDEA:'):
-                if current_idea:
-                    ideas.append(current_idea)
-                current_idea = {"title": line[5:].strip()}
-            elif line.startswith('DESC:'):
-                current_idea["description"] = line[5:].strip()
-            elif line.startswith('TYPE:'):
-                current_idea["type"] = line[5:].strip().lower()
+#         for line in response.strip().split('\n'):
+#             line = line.strip()
+#             if line.startswith('IDEA:'):
+#                 if current_idea:
+#                     ideas.append(current_idea)
+#                 current_idea = {"title": line[5:].strip()}
+#             elif line.startswith('DESC:'):
+#                 current_idea["description"] = line[5:].strip()
+#             elif line.startswith('TYPE:'):
+#                 current_idea["type"] = line[5:].strip().lower()
         
-        if current_idea and "title" in current_idea:
-            ideas.append(current_idea)
+#         if current_idea and "title" in current_idea:
+#             ideas.append(current_idea)
         
-        return ideas[:5]
-    except Exception as e:
-        logger.error(f"Idea extraction error: {e}")
-        return []
+#         return ideas[:5]
+#     except Exception as e:
+#         logger.error(f"Idea extraction error: {e}")
+#         return []
 
-async def generate_smart_tags(title: str, url: str, platform: str, existing_tags: List[str] = None) -> List[Dict[str, Any]]:
-    """Generate smart tag suggestions with clustering - PREMIUM FEATURE"""
-    try:
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return []
+# async def generate_smart_tags(title: str, url: str, platform: str, existing_tags: List[str] = None) -> List[Dict[str, Any]]:
+#     """Generate smart tag suggestions with clustering - PREMIUM FEATURE"""
+#     try:
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if not api_key:
+#             return []
         
-        existing_str = ", ".join(existing_tags) if existing_tags else "none"
+#         existing_str = ", ".join(existing_tags) if existing_tags else "none"
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"tags-{uuid.uuid4()}",
-            system_message="""You are a content tagging expert. Suggest 5-7 relevant tags for content organization.
-Consider:
-- Topic/subject matter
-- Content type (tutorial, review, news, etc.)
-- Industry/domain
-- Skill level (beginner, advanced, etc.)
-- Action type (read, watch, implement, etc.)
+#         chat = LlmChat(
+#             api_key=api_key,
+#             session_id=f"tags-{uuid.uuid4()}",
+#             system_message="""You are a content tagging expert. Suggest 5-7 relevant tags for content organization.
+# Consider:
+# - Topic/subject matter
+# - Content type (tutorial, review, news, etc.)
+# - Industry/domain
+# - Skill level (beginner, advanced, etc.)
+# - Action type (read, watch, implement, etc.)
 
-For each tag, indicate confidence (high, medium, low) and cluster/category.
+# For each tag, indicate confidence (high, medium, low) and cluster/category.
 
-Format:
-TAG: [tag_name] | CONFIDENCE: [high/medium/low] | CLUSTER: [category]"""
-        ).with_model("openai", "gpt-4")
+# Format:
+# TAG: [tag_name] | CONFIDENCE: [high/medium/low] | CLUSTER: [category]"""
+#         ).with_model("openai", "gpt-4")
         
-        user_message = UserMessage(
-            text=f"Suggest smart tags for:\nTitle: {title}\nPlatform: {platform}\nExisting tags: {existing_str}"
-        )
+#         user_message = UserMessage(
+#             text=f"Suggest smart tags for:\nTitle: {title}\nPlatform: {platform}\nExisting tags: {existing_str}"
+#         )
         
-        response = await chat.send_message(user_message)
+#         response = await chat.send_message(user_message)
         
-        # Parse tags
-        tags = []
-        for line in response.strip().split('\n'):
-            if line.startswith('TAG:'):
-                parts = line.split('|')
-                if len(parts) >= 3:
-                    tag_name = parts[0].replace('TAG:', '').strip()
-                    confidence = parts[1].replace('CONFIDENCE:', '').strip().lower()
-                    cluster = parts[2].replace('CLUSTER:', '').strip()
-                    tags.append({
-                        "name": tag_name,
-                        "confidence": confidence,
-                        "cluster": cluster,
-                        "is_new": tag_name.lower() not in [t.lower() for t in (existing_tags or [])]
-                    })
+#         # Parse tags
+#         tags = []
+#         for line in response.strip().split('\n'):
+#             if line.startswith('TAG:'):
+#                 parts = line.split('|')
+#                 if len(parts) >= 3:
+#                     tag_name = parts[0].replace('TAG:', '').strip()
+#                     confidence = parts[1].replace('CONFIDENCE:', '').strip().lower()
+#                     cluster = parts[2].replace('CLUSTER:', '').strip()
+#                     tags.append({
+#                         "name": tag_name,
+#                         "confidence": confidence,
+#                         "cluster": cluster,
+#                         "is_new": tag_name.lower() not in [t.lower() for t in (existing_tags or [])]
+#                     })
         
-        return tags[:7]
-    except Exception as e:
-        logger.error(f"Smart tags error: {e}")
-        return []
+#         return tags[:7]
+#     except Exception as e:
+#         logger.error(f"Smart tags error: {e}")
+#         return []
 
-async def generate_action_items(title: str, url: str, platform: str, notes: str = "") -> List[Dict[str, Any]]:
-    """Turn saved content into actionable tasks - PREMIUM FEATURE"""
-    try:
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return []
+# async def generate_action_items(title: str, url: str, platform: str, notes: str = "") -> List[Dict[str, Any]]:
+#     """Turn saved content into actionable tasks - PREMIUM FEATURE"""
+#     try:
+#         api_key = os.environ.get('EMERGENT_LLM_KEY')
+#         if not api_key:
+#             return []
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"actions-{uuid.uuid4()}",
-            system_message="""You are a productivity expert. Convert saved content into 3-5 specific, actionable tasks.
-Each action should be:
-- Concrete and specific
-- Achievable in a reasonable timeframe
-- Relevant to the content
+#         chat = LlmChat(
+#             api_key=api_key,
+#             session_id=f"actions-{uuid.uuid4()}",
+#             system_message="""You are a productivity expert. Convert saved content into 3-5 specific, actionable tasks.
+# Each action should be:
+# - Concrete and specific
+# - Achievable in a reasonable timeframe
+# - Relevant to the content
 
-Format each action as:
-ACTION: [task description]
-PRIORITY: [high/medium/low]
-TIME: [estimated time: 5min/15min/30min/1hr/2hr+]
-CATEGORY: [learn/create/share/implement/review]"""
-        ).with_model("openai", "gpt-4")
+# Format each action as:
+# ACTION: [task description]
+# PRIORITY: [high/medium/low]
+# TIME: [estimated time: 5min/15min/30min/1hr/2hr+]
+# CATEGORY: [learn/create/share/implement/review]"""
+#         ).with_model("openai", "gpt-4")
         
-        notes_str = f"\nUser notes: {notes}" if notes else ""
+#         notes_str = f"\nUser notes: {notes}" if notes else ""
         
-        user_message = UserMessage(
-            text=f"Generate action items from this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}{notes_str}"
-        )
+#         user_message = UserMessage(
+#             text=f"Generate action items from this saved content:\nTitle: {title}\nPlatform: {platform}\nURL: {url}{notes_str}"
+#         )
         
-        response = await chat.send_message(user_message)
+#         response = await chat.send_message(user_message)
         
-        # Parse action items
-        actions = []
-        current_action = {}
+#         # Parse action items
+#         actions = []
+#         current_action = {}
         
-        for line in response.strip().split('\n'):
-            line = line.strip()
-            if line.startswith('ACTION:'):
-                if current_action and "task" in current_action:
-                    actions.append(current_action)
-                current_action = {"task": line[7:].strip(), "completed": False}
-            elif line.startswith('PRIORITY:'):
-                current_action["priority"] = line[9:].strip().lower()
-            elif line.startswith('TIME:'):
-                current_action["estimated_time"] = line[5:].strip()
-            elif line.startswith('CATEGORY:'):
-                current_action["category"] = line[9:].strip().lower()
+#         for line in response.strip().split('\n'):
+#             line = line.strip()
+#             if line.startswith('ACTION:'):
+#                 if current_action and "task" in current_action:
+#                     actions.append(current_action)
+#                 current_action = {"task": line[7:].strip(), "completed": False}
+#             elif line.startswith('PRIORITY:'):
+#                 current_action["priority"] = line[9:].strip().lower()
+#             elif line.startswith('TIME:'):
+#                 current_action["estimated_time"] = line[5:].strip()
+#             elif line.startswith('CATEGORY:'):
+#                 current_action["category"] = line[9:].strip().lower()
         
-        if current_action and "task" in current_action:
-            actions.append(current_action)
+#         if current_action and "task" in current_action:
+#             actions.append(current_action)
         
-        return actions[:5]
-    except Exception as e:
-        logger.error(f"Action items error: {e}")
-        return []
+#         return actions[:5]
+#     except Exception as e:
+#         logger.error(f"Action items error: {e}")
+#         return []
 
 # ============== AI Endpoints ==============
 
-@api_router.post("/items/{item_id}/ai-summary")
-async def generate_item_summary(item_id: str, current_user: dict = Depends(get_current_user)):
-    """Generate AI summary for an item"""
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+# @api_router.post("/items/{item_id}/ai-summary")
+# async def generate_item_summary(item_id: str, current_user: dict = Depends(get_current_user)):
+#     """Generate AI summary for an item"""
+#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+#     if not item:
+#         raise HTTPException(status_code=404, detail="Item not found")
     
-    summary = await generate_ai_summary(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
+#     summary = await generate_ai_summary(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
     
-    if summary:
-        await db.items.update_one({"id": item_id}, {"$set": {"ai_summary": summary}})
+#     if summary:
+#         await db.items.update_one({"id": item_id}, {"$set": {"ai_summary": summary}})
     
-    return {"summary": summary}
+#     return {"summary": summary}
 
-@api_router.post("/items/{item_id}/extract-ideas")
-async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
-    """Extract key ideas from an item - PREMIUM FEATURE"""
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+# @api_router.post("/items/{item_id}/extract-ideas")
+# async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
+#     """Extract key ideas from an item - PREMIUM FEATURE"""
+#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+#     if not item:
+#         raise HTTPException(status_code=404, detail="Item not found")
     
-    ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
+#     ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
     
-    if ideas:
-        await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
+#     if ideas:
+#         await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
     
-    return {"ideas": ideas}
+#     return {"ideas": ideas}
 
-@api_router.post("/items/{item_id}/smart-tags")
-async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
-    """Generate smart tag suggestions - PREMIUM FEATURE"""
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+# @api_router.post("/items/{item_id}/smart-tags")
+# async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
+#     """Generate smart tag suggestions - PREMIUM FEATURE"""
+#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+#     if not item:
+#         raise HTTPException(status_code=404, detail="Item not found")
     
-    tags = await generate_smart_tags(
-        item.get("title", ""), 
-        item.get("url", ""), 
-        item.get("platform", "Web"),
-        item.get("tags", [])
-    )
+#     tags = await generate_smart_tags(
+#         item.get("title", ""), 
+#         item.get("url", ""), 
+#         item.get("platform", "Web"),
+#         item.get("tags", [])
+#     )
     
-    return {"suggested_tags": tags}
+#     return {"suggested_tags": tags}
 
-@api_router.post("/items/{item_id}/action-items")
-async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
-    """Generate action items from content - PREMIUM FEATURE"""
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+# @api_router.post("/items/{item_id}/action-items")
+# async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
+#     """Generate action items from content - PREMIUM FEATURE"""
+#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+#     if not item:
+#         raise HTTPException(status_code=404, detail="Item not found")
     
-    actions = await generate_action_items(
-        item.get("title", ""), 
-        item.get("url", ""), 
-        item.get("platform", "Web"),
-        item.get("notes", "")
-    )
+#     actions = await generate_action_items(
+#         item.get("title", ""), 
+#         item.get("url", ""), 
+#         item.get("platform", "Web"),
+#         item.get("notes", "")
+#     )
     
-    if actions:
-        await db.items.update_one({"id": item_id}, {"$set": {"action_items": actions}})
+#     if actions:
+#         await db.items.update_one({"id": item_id}, {"$set": {"action_items": actions}})
     
-    return {"action_items": actions}
+#     return {"action_items": actions}
 
 @api_router.put("/items/{item_id}/action-items/{action_index}/toggle")
 async def toggle_action_item(item_id: str, action_index: int, current_user: dict = Depends(get_current_user)):
@@ -1102,7 +1095,8 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         "created_at": {"$gte": week_ago}
     }).to_list(10)
     
-    weekly_summary = await generate_weekly_summary(user_id, recent_items)
+    # weekly_summary = await generate_weekly_summary(user_id, recent_items)
+    weekly_summary = None  # Placeholder since AI function is commented out
     
     return InsightsResponse(
         total_items=total_items,
