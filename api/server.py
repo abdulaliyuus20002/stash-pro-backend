@@ -15,7 +15,7 @@ import httpx
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlparse
-from services.ai_service import (
+from .services.ai_service import (
     generate_summary,
     generate_smart_tags,
     extract_ideas,
@@ -29,15 +29,31 @@ from fastapi import BackgroundTasks
 from fastapi import HTTPException
 
 
-assert os.environ.get("OPENAI_API_KEY"),
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+def require_ai():
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="AI service not configured"
+        )
 
 
-mongo_url = os.environ.get("MONGO_URL")
-if not mongo_url:
-    raise RuntimeError("MONGO_URL environment variable is not set")
+client = None
+db = None
 
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get("DB_NAME", "stash_db")]
+def get_db():
+    global client, db
+
+    if db is None:
+        mongo_url = os.environ.get("MONGO_URL")
+        if not mongo_url:
+            raise HTTPException(status_code=500, detail="Database not configured")
+
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[os.environ.get("DB_NAME", "stash_db")]
+
+    return db
 
 
 
@@ -225,6 +241,7 @@ class PushTokenRequest(BaseModel):
 
 
 async def run_ai_summary_job(item_id: str, user_id: str):
+     db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": user_id})
     if not item or item.get("ai_summary"):
         return
@@ -236,6 +253,7 @@ async def run_ai_summary_job(item_id: str, user_id: str):
     )
 
     if summary:
+        db = get_db()
         await db.items.update_one(
             {"id": item_id},
             {"$set": {"ai_summary": summary}}
@@ -277,6 +295,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
         
+        db = get_db()
         user = await db.users.find_one({"id": user_id})
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
@@ -386,6 +405,7 @@ async def fetch_url_metadata(url: str) -> dict:
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
     # Check if user exists
+    db = get_db()
     existing = await db.users.find_one({"email": user_data.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -400,7 +420,7 @@ async def register(user_data: UserCreate):
         "plan_type": "free",
         "created_at": datetime.utcnow()
     }
-    
+    db = get_db()
     await db.users.insert_one(user)
     
     token = create_access_token(user_id)
@@ -418,6 +438,7 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login", response_model=TokenResponse)
 async def login(credentials: UserLogin):
+    db = get_db()
     user = await db.users.find_one({"email": credentials.email.lower()})
     
     if not user or not verify_password(credentials.password, user["password"]):
@@ -508,6 +529,7 @@ async def create_item(
 
     if limits["max_items"] != -1 and item_data.collections:
         for collection_id in item_data.collections:
+            db = get_db()
             count = await db.items.count_documents({
                 "user_id": current_user["id"],
                 "collections": collection_id
@@ -530,6 +552,7 @@ async def create_item(
     # ================= AUTO COLLECTION (PRO ONLY) =================
     if is_pro_user(current_user):
         try:
+            db = get_db()
             collections = await db.collections.find(
                 {"user_id": current_user["id"]}
             ).to_list(50)
@@ -552,6 +575,7 @@ async def create_item(
                         collection_id = existing["id"]
                 else:
                     collection_id = str(uuid.uuid4())
+                    db = get_db()
                     await db.collections.insert_one({
                         "id": collection_id,
                         "user_id": current_user["id"],
@@ -561,6 +585,7 @@ async def create_item(
                     })
 
                 if collection_id:
+                    db = get_db()
                     await db.items.update_one(
                         {"id": item_id},
                         {"$set": {"collections": [collection_id]}}
@@ -590,12 +615,13 @@ async def get_items(
         query["tags"] = tag
     
     sort_order = -1 if sort == "newest" else 1
-    
+    db = get_db()
     items = await db.items.find(query).sort("created_at", sort_order).to_list(1000)
     return [SavedItemResponse(**item) for item in items]
 
 @api_router.get("/items/{item_id}", response_model=SavedItemResponse)
 async def get_item(item_id: str, current_user: dict = Depends(get_current_user)):
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -603,6 +629,7 @@ async def get_item(item_id: str, current_user: dict = Depends(get_current_user))
 
 @api_router.put("/items/{item_id}", response_model=SavedItemResponse)
 async def update_item(item_id: str, update_data: SavedItemUpdate, current_user: dict = Depends(get_current_user)):
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -617,6 +644,7 @@ async def update_item(item_id: str, update_data: SavedItemUpdate, current_user: 
 
 @api_router.delete("/items/{item_id}")
 async def delete_item(item_id: str, current_user: dict = Depends(get_current_user)):
+    db = get_db()
     result = await db.items.delete_one({"id": item_id, "user_id": current_user["id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -632,6 +660,7 @@ async def create_collection(
     limits = get_user_limits(current_user)
 
     if limits["max_collections"] != -1:
+        db = get_db()
         count = await db.collections.count_documents(
             {"user_id": current_user["id"]}
         )
@@ -660,10 +689,12 @@ async def create_collection(
 
 @api_router.get("/collections", response_model=List[CollectionResponse])
 async def get_collections(current_user: dict = Depends(get_current_user)):
+    db = get_db()
     collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
     
     result = []
     for col in collections:
+        db = get_db()
         item_count = await db.items.count_documents({
             "user_id": current_user["id"],
             "collections": col["id"]
@@ -674,12 +705,15 @@ async def get_collections(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/collections/{collection_id}", response_model=CollectionResponse)
 async def update_collection(collection_id: str, data: CollectionUpdate, current_user: dict = Depends(get_current_user)):
+    db = get_db()
     collection = await db.collections.find_one({"id": collection_id, "user_id": current_user["id"]})
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
     
+    db = get_db()
     await db.collections.update_one({"id": collection_id}, {"$set": {"name": data.name}})
     
+    db = get_db()
     updated = await db.collections.find_one({"id": collection_id})
     item_count = await db.items.count_documents({
         "user_id": current_user["id"],
@@ -690,11 +724,13 @@ async def update_collection(collection_id: str, data: CollectionUpdate, current_
 
 @api_router.delete("/collections/{collection_id}")
 async def delete_collection(collection_id: str, current_user: dict = Depends(get_current_user)):
+    db = get_db()
     result = await db.collections.delete_one({"id": collection_id, "user_id": current_user["id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Collection not found")
     
     # Remove collection from all items
+    db = get_db()
     await db.items.update_many(
         {"user_id": current_user["id"], "collections": collection_id},
         {"$pull": {"collections": collection_id}}
@@ -720,7 +756,7 @@ async def search_items(q: str, current_user: dict = Depends(get_current_user)):
             {"url": {"$regex": q, "$options": "i"}}
         ]
     }
-    
+    db = get_db()
     items = await db.items.find(query).sort("created_at", -1).to_list(100)
     return [SavedItemResponse(**item) for item in items]
 
@@ -736,6 +772,7 @@ async def get_all_tags(current_user: dict = Depends(get_current_user)):
         {"$sort": {"_id": 1}}
     ]
     
+    db = get_db()
     result = await db.items.aggregate(pipeline).to_list(100)
     return [r["_id"] for r in result]
 
@@ -1018,7 +1055,9 @@ PLATFORM_COLLECTIONS = {
 @api_router.post("/items/{item_id}/extract-ideas")
 async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
     """Extract key ideas from an item - PREMIUM FEATURE"""
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_ai()
     require_pro(current_user)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1026,6 +1065,7 @@ async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_curr
     ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
     
     if ideas:
+        db = get_db()
         await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
     
     return {"ideas": ideas}
@@ -1033,7 +1073,9 @@ async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_curr
 @api_router.post("/items/{item_id}/smart-tags")
 async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
     """Generate smart tag suggestions - PREMIUM FEATURE"""
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_ai()
     require_pro(current_user)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1050,6 +1092,7 @@ async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(ge
 @api_router.post("/items/{item_id}/action-items")
 async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_ai()
     require_pro(current_user)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1061,6 +1104,7 @@ async def generate_item_actions(item_id: str, current_user: dict = Depends(get_c
     )
 
     if actions:
+        db = get_db()
         await db.items.update_one(
             {"id": item_id},
             {"$set": {"action_items": actions}}
@@ -1071,6 +1115,7 @@ async def generate_item_actions(item_id: str, current_user: dict = Depends(get_c
 @api_router.put("/items/{item_id}/action-items/{action_index}/toggle")
 async def toggle_action_item(item_id: str, action_index: int, current_user: dict = Depends(get_current_user)):
     """Toggle action item completion status"""
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1080,6 +1125,7 @@ async def toggle_action_item(item_id: str, action_index: int, current_user: dict
         raise HTTPException(status_code=400, detail="Invalid action index")
     
     action_items[action_index]["completed"] = not action_items[action_index].get("completed", False)
+    db = get_db()
     await db.items.update_one({"id": item_id}, {"$set": {"action_items": action_items}})
     
     return {"action_items": action_items}
@@ -1087,6 +1133,7 @@ async def toggle_action_item(item_id: str, action_index: int, current_user: dict
 @api_router.post("/items/{item_id}/apply-smart-tag")
 async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depends(get_current_user)):
     """Apply a suggested smart tag to an item"""
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -1094,6 +1141,7 @@ async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depe
     current_tags = item.get("tags", [])
     if tag_name not in current_tags:
         current_tags.append(tag_name)
+        db = get_db()
         await db.items.update_one({"id": item_id}, {"$set": {"tags": current_tags}})
     
     return {"tags": current_tags}
@@ -1103,12 +1151,16 @@ async def get_collection_suggestion(
     item_id: str,
     current_user: dict = Depends(get_current_user),
 ):
+    require_ai()
     require_pro(current_user)
 
+    db = get_db()
     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     if not item:
         raise HTTPException(404, "Item not found")
 
+    
+    db = get_db()
     collections = await db.collections.find(
         {"user_id": current_user["id"]}
     ).to_list(50)
@@ -1131,10 +1183,12 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     
     # Total items
+    db = get_db()
     total_items = await db.items.count_documents({"user_id": user_id})
     
     # Items this week
     week_ago = datetime.utcnow() - timedelta(days=7)
+    db = get_db()
     items_this_week = await db.items.count_documents({
         "user_id": user_id,
         "created_at": {"$gte": week_ago}
@@ -1147,6 +1201,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         {"$sort": {"count": -1}},
         {"$limit": 5}
     ]
+    db = get_db()
     top_platforms = await db.items.aggregate(platform_pipeline).to_list(5)
     
     # Top tags
@@ -1157,13 +1212,16 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         {"$sort": {"count": -1}},
         {"$limit": 5}
     ]
+    db = get_db()
     top_tags = await db.items.aggregate(tags_pipeline).to_list(5)
     
     # Collections count
+    db = get_db()
     collections_count = await db.collections.count_documents({"user_id": user_id})
     
     # Resurfaced items (saved 30+ days ago)
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    db = get_db()
     old_items = await db.items.find({
         "user_id": user_id,
         "created_at": {"$lte": thirty_days_ago}
@@ -1181,7 +1239,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
             "message": f"You saved this {days_ago} days ago"
         })
     
-    
+    db = get_db()
     weekly_items = await db.items.find(
         {"user_id": user_id, "created_at": {"$gte": week_ago}}
     ).to_list(10)
@@ -1206,7 +1264,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
 async def get_resurfaced_items(current_user: dict = Depends(get_current_user)):
     """Get items to resurface (saved 30+ days ago)"""
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    
+    db = get_db()
     items = await db.items.find({
         "user_id": current_user["id"],
         "created_at": {"$lte": thirty_days_ago}
@@ -1243,6 +1301,7 @@ async def change_password(
 
     new_hashed = hash_password(data.new_password)
 
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": {"password": new_hashed}}
@@ -1256,10 +1315,13 @@ async def delete_account(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
 
     # Delete user-related data
+    db = get_db()
     await db.items.delete_many({"user_id": user_id})
+    db = get_db()
     await db.collections.delete_many({"user_id": user_id})
 
     # Delete user
+    db = get_db()
     result = await db.users.delete_one({"id": user_id})
 
     if result.deleted_count == 0:
@@ -1277,6 +1339,7 @@ async def update_profile(
 
     # Username uniqueness check
     if data.username:
+        db = get_db()
         existing = await db.users.find_one({
             "username": data.username.lower(),
             "id": {"$ne": current_user["id"]}
@@ -1297,11 +1360,13 @@ async def update_profile(
     if not update_data:
         return {"message": "No changes provided"}
 
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": update_data}
     )
 
+    db = get_db()
     updated_user = await db.users.find_one({"id": current_user["id"]})
 
     return {
@@ -1323,6 +1388,7 @@ async def save_push_token(
     data: PushTokenRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": {
@@ -1361,6 +1427,7 @@ async def get_notification_settings(current_user: dict = Depends(get_current_use
 @api_router.put("/users/preferences")
 async def update_preferences(preferences: UserPreferences, current_user: dict = Depends(get_current_user)):
     """Update user preferences from onboarding"""
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": {
@@ -1373,6 +1440,7 @@ async def update_preferences(preferences: UserPreferences, current_user: dict = 
 @api_router.get("/users/preferences")
 async def get_preferences(current_user: dict = Depends(get_current_user)):
     """Get user preferences"""
+    db = get_db()
     user = await db.users.find_one({"id": current_user["id"]})
     return user.get("preferences", {
         "save_types": [],
@@ -1385,11 +1453,14 @@ async def get_preferences(current_user: dict = Depends(get_current_user)):
 @api_router.get("/users/plan")
 async def get_user_plan(current_user: dict = Depends(get_current_user)):
     """Get user's current plan and limits"""
+    db = get_db()
     user = await db.users.find_one({"id": current_user["id"]})
     is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
     
     # Count current usage
+    db = get_db()
     items_count = await db.items.count_documents({"user_id": current_user["id"]})
+    db = get_db()
     collections_count = await db.collections.count_documents({"user_id": current_user["id"]})
     
     limits = get_user_limits(user)
@@ -1421,6 +1492,7 @@ async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
     # For now, we'll simulate the upgrade
     pro_expires_at = datetime.utcnow() + timedelta(days=30)  # 30-day subscription
     
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": {
@@ -1439,6 +1511,7 @@ async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
 @api_router.post("/users/cancel-pro")
 async def cancel_pro(current_user: dict = Depends(get_current_user)):
     """Cancel Pro subscription"""
+    db = get_db()
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": {
@@ -1463,6 +1536,7 @@ async def advanced_search(
     current_user: dict = Depends(get_current_user)
 ):
     """Advanced search with notes & tags - PRO FEATURE"""
+    db = get_db()
     user = await db.users.find_one({"id": current_user["id"]})
     is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
     
@@ -1491,7 +1565,7 @@ async def advanced_search(
         query["platform"] = platform
     if collection_id:
         query["collections"] = collection_id
-    
+    db = get_db()
     items = await db.items.find(query).sort("created_at", -1).to_list(100)
     
     return {
@@ -1509,6 +1583,7 @@ async def advanced_search(
 @api_router.get("/export/vault")
 async def export_vault(current_user: dict = Depends(get_current_user)):
     """Export all user data - PRO FEATURE"""
+    db = get_db()
     user = await db.users.find_one({"id": current_user["id"]})
     is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
     
@@ -1519,7 +1594,9 @@ async def export_vault(current_user: dict = Depends(get_current_user)):
         )
     
     # Get all user data
+    db = get_db()
     items = await db.items.find({"user_id": current_user["id"]}).to_list(1000)
+    db = get_db()
     collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
     
     # Prepare export data
@@ -1566,6 +1643,7 @@ async def export_vault(current_user: dict = Depends(get_current_user)):
 @api_router.get("/reminders")
 async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
     """Get smart resurfacing reminders - PRO FEATURE"""
+    db = get_db()
     user = await db.users.find_one({"id": current_user["id"]})
     is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
     
@@ -1581,6 +1659,8 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
     week_ago = datetime.utcnow() - timedelta(days=7)
     week_ago_start = week_ago.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago_end = week_ago.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    db = get_db()
     
     weekly_items = await db.items.find({
         "user_id": current_user["id"],
@@ -1597,6 +1677,7 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
         })
     
     # Items with incomplete action items
+    db = get_db()
     items_with_actions = await db.items.find({
         "user_id": current_user["id"],
         "action_items": {"$exists": True, "$ne": []},
@@ -1624,6 +1705,7 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
     
     # Items saved 30+ days ago (resurface)
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    db = get_db()
     old_items = await db.items.find({
         "user_id": current_user["id"],
         "created_at": {"$lte": thirty_days_ago}
@@ -1680,4 +1762,5 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client:
+        client.close()
