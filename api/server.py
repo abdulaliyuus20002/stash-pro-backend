@@ -658,10 +658,10 @@ async def create_collection(
     data: CollectionCreate,
     current_user: dict = Depends(get_current_user)
 ):
+    db = get_db()
     limits = get_user_limits(current_user)
 
     if limits["max_collections"] != -1:
-        db = get_db()
         count = await db.collections.count_documents(
             {"user_id": current_user["id"]}
         )
@@ -1092,9 +1092,14 @@ async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(ge
 
 @api_router.post("/items/{item_id}/action-items")
 async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
-    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
     require_ai()
     require_pro(current_user)
+
+    db = get_db()
+    item = await db.items.find_one(
+        {"id": item_id, "user_id": current_user["id"]}
+    )
+
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
@@ -1105,7 +1110,6 @@ async def generate_item_actions(item_id: str, current_user: dict = Depends(get_c
     )
 
     if actions:
-        db = get_db()
         await db.items.update_one(
             {"id": item_id},
             {"$set": {"action_items": actions}}
