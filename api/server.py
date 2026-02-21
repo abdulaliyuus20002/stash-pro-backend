@@ -241,8 +241,10 @@ class PushTokenRequest(BaseModel):
 
 
 async def run_ai_summary_job(item_id: str, user_id: str):
-     db = get_db()
-    item = await db.items.find_one({"id": item_id, "user_id": user_id})
+    db = get_db()
+    item = await db.items.find_one(
+        {"id": item_id, "user_id": user_id}
+    )
     if not item or item.get("ai_summary"):
         return
 
@@ -253,7 +255,6 @@ async def run_ai_summary_job(item_id: str, user_id: str):
     )
 
     if summary:
-        db = get_db()
         await db.items.update_one(
             {"id": item_id},
             {"$set": {"ai_summary": summary}}
