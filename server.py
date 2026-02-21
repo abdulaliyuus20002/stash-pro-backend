@@ -1,6 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -16,13 +15,21 @@ import httpx
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlparse
-# from emergentintegrations.llm.chat import LlmChat, UserMessage
+from services.ai_service import (
+    generate_summary,
+    generate_smart_tags,
+    extract_ideas,
+    generate_action_items,
+    generate_weekly_summary,
+    suggest_auto_collection,
+)
 import asyncio
 import random
+from fastapi import BackgroundTasks
+from fastapi import HTTPException
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
 
+assert os.environ.get("OPENAI_API_KEY"), "Missing OPENAI_API_KEY"
 
 
 mongo_url = os.environ.get("MONGO_URL")
@@ -31,6 +38,8 @@ if not mongo_url:
 
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get("DB_NAME", "stash_db")]
+
+
 
 
 # JWT Configuration
@@ -99,8 +108,8 @@ class ChangePasswordRequest(BaseModel):
 
 # Plan limits
 FREE_PLAN_LIMITS = {
-    "max_collections": 5,
-    "max_items": 50,
+    "max_collections": 10,   # ✅ FREE: 10 collections
+    "max_items": 100,        # ✅ FREE: 100 items per collection
     "advanced_search": False,
     "smart_reminders": False,
     "vault_export": False,
@@ -109,7 +118,7 @@ FREE_PLAN_LIMITS = {
 
 PRO_PLAN_LIMITS = {
     "max_collections": -1,  # Unlimited
-    "max_items": -1,  # Unlimited
+    "max_items": -1,        # Unlimited
     "advanced_search": True,
     "smart_reminders": True,
     "vault_export": True,
@@ -120,9 +129,13 @@ PRO_PLAN_LIMITS = {
 
 def get_user_limits(user: dict) -> dict:
     """Get limits based on user's plan"""
-    if user.get("is_pro") or user.get("plan_type") == "pro":
+    if is_pro_user(user):
         return PRO_PLAN_LIMITS
     return FREE_PLAN_LIMITS
+
+def is_pro_user(user: dict) -> bool:
+    return user.get("is_pro") or user.get("plan_type") == "pro"
+
 
 class SavedItemCreate(BaseModel):
     url: str
@@ -210,6 +223,25 @@ class PushTokenRequest(BaseModel):
     push_token: str
 
 
+
+async def run_ai_summary_job(item_id: str, user_id: str):
+    item = await db.items.find_one({"id": item_id, "user_id": user_id})
+    if not item or item.get("ai_summary"):
+        return
+
+    summary = await generate_summary(
+        title=item["title"],
+        platform=item["platform"],
+        url=item["url"],
+    )
+
+    if summary:
+        await db.items.update_one(
+            {"id": item_id},
+            {"$set": {"ai_summary": summary}}
+        )
+
+
 # ============== Auth Helpers ==============
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -224,6 +256,18 @@ def create_access_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     payload = {"sub": user_id, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def require_pro(user: dict):
+    if not is_pro_user(user):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "This feature is available on Pro",
+                "upgrade_required": True,
+                "feature": "ai_features",
+                "cta": "Upgrade to Pro to unlock AI features"
+            }
+        )
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -429,7 +473,10 @@ async def extract_metadata(data: dict, current_user: dict = Depends(get_current_
 # ============== Saved Items Routes ==============
 
 @api_router.post("/items", response_model=SavedItemResponse)
-async def create_item(item_data: SavedItemCreate, current_user: dict = Depends(get_current_user)):
+async def create_item(
+    item_data: SavedItemCreate,
+    current_user: dict = Depends(get_current_user),
+):
     # Fetch metadata if not provided
     if not item_data.title or not item_data.platform:
         metadata = await fetch_url_metadata(item_data.url)
@@ -441,7 +488,7 @@ async def create_item(item_data: SavedItemCreate, current_user: dict = Depends(g
             item_data.content_type = metadata["content_type"]
         if not item_data.thumbnail_url:
             item_data.thumbnail_url = metadata["thumbnail_url"]
-    
+
     item_id = str(uuid.uuid4())
     item = {
         "id": item_id,
@@ -454,11 +501,75 @@ async def create_item(item_data: SavedItemCreate, current_user: dict = Depends(g
         "notes": item_data.notes or "",
         "tags": item_data.tags or [],
         "collections": item_data.collections or [],
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow(),
     }
-    
+
+    limits = get_user_limits(current_user)
+
+    if limits["max_items"] != -1 and item_data.collections:
+        for collection_id in item_data.collections:
+            count = await db.items.count_documents({
+                "user_id": current_user["id"],
+                "collections": collection_id
+            })
+
+            if count >= limits["max_items"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "Collection item limit reached",
+                        "upgrade_required": True,
+                        "feature": "items_per_collection",
+                        "limit": limits["max_items"],
+                        "cta": "Upgrade to Pro to save unlimited items"
+                    }
+                )
+
     await db.items.insert_one(item)
-    
+
+    # ================= AUTO COLLECTION (PRO ONLY) =================
+    if is_pro_user(current_user):
+        try:
+            collections = await db.collections.find(
+                {"user_id": current_user["id"]}
+            ).to_list(50)
+
+            suggestion = await suggest_auto_collection(
+                title=item["title"],
+                platform=item["platform"],
+                existing_collections=[c["name"] for c in collections],
+            )
+
+            if suggestion:
+                collection_id = None
+
+                if not suggestion["is_new"]:
+                    existing = next(
+                        (c for c in collections if c["name"] == suggestion["collection_name"]),
+                        None
+                    )
+                    if existing:
+                        collection_id = existing["id"]
+                else:
+                    collection_id = str(uuid.uuid4())
+                    await db.collections.insert_one({
+                        "id": collection_id,
+                        "user_id": current_user["id"],
+                        "name": suggestion["collection_name"],
+                        "created_at": datetime.utcnow(),
+                        "is_auto": True,
+                    })
+
+                if collection_id:
+                    await db.items.update_one(
+                        {"id": item_id},
+                        {"$set": {"collections": [collection_id]}}
+                    )
+                    item["collections"] = [collection_id]
+
+        except Exception as e:
+            logger.warning(f"Auto-collection failed: {e}")
+
     return SavedItemResponse(**item)
 
 @api_router.get("/items", response_model=List[SavedItemResponse])
@@ -514,23 +625,37 @@ async def delete_item(item_id: str, current_user: dict = Depends(get_current_use
 # ============== Collections Routes ==============
 
 @api_router.post("/collections", response_model=CollectionResponse)
-async def create_collection(data: CollectionCreate, current_user: dict = Depends(get_current_user)):
-    # Check collection limit for free users
-    if current_user.get("plan_type", "free") == "free":
-        count = await db.collections.count_documents({"user_id": current_user["id"]})
-        if count >= 5:
-            raise HTTPException(status_code=403, detail="Free plan limited to 5 collections. Upgrade to Pro for unlimited.")
-    
-    collection_id = str(uuid.uuid4())
+async def create_collection(
+    data: CollectionCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    limits = get_user_limits(current_user)
+
+    if limits["max_collections"] != -1:
+        count = await db.collections.count_documents(
+            {"user_id": current_user["id"]}
+        )
+        if count >= limits["max_collections"]:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Collection limit reached",
+                    "upgrade_required": True,
+                    "feature": "collections",
+                    "limit": limits["max_collections"],
+                    "cta": "Upgrade to Pro for unlimited collections"
+                }
+            )
+
     collection = {
-        "id": collection_id,
+        "id": str(uuid.uuid4()),
         "user_id": current_user["id"],
         "name": data.name,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow(),
+        "is_auto": data.is_auto,
     }
-    
+
     await db.collections.insert_one(collection)
-    
     return CollectionResponse(**collection, item_count=0)
 
 @api_router.get("/collections", response_model=List[CollectionResponse])
@@ -816,58 +941,7 @@ PLATFORM_COLLECTIONS = {
 #         logger.error(f"Idea extraction error: {e}")
 #         return []
 
-# async def generate_smart_tags(title: str, url: str, platform: str, existing_tags: List[str] = None) -> List[Dict[str, Any]]:
-#     """Generate smart tag suggestions with clustering - PREMIUM FEATURE"""
-#     try:
-#         api_key = os.environ.get('EMERGENT_LLM_KEY')
-#         if not api_key:
-#             return []
-        
-#         existing_str = ", ".join(existing_tags) if existing_tags else "none"
-        
-#         chat = LlmChat(
-#             api_key=api_key,
-#             session_id=f"tags-{uuid.uuid4()}",
-#             system_message="""You are a content tagging expert. Suggest 5-7 relevant tags for content organization.
-# Consider:
-# - Topic/subject matter
-# - Content type (tutorial, review, news, etc.)
-# - Industry/domain
-# - Skill level (beginner, advanced, etc.)
-# - Action type (read, watch, implement, etc.)
 
-# For each tag, indicate confidence (high, medium, low) and cluster/category.
-
-# Format:
-# TAG: [tag_name] | CONFIDENCE: [high/medium/low] | CLUSTER: [category]"""
-#         ).with_model("openai", "gpt-4")
-        
-#         user_message = UserMessage(
-#             text=f"Suggest smart tags for:\nTitle: {title}\nPlatform: {platform}\nExisting tags: {existing_str}"
-#         )
-        
-#         response = await chat.send_message(user_message)
-        
-#         # Parse tags
-#         tags = []
-#         for line in response.strip().split('\n'):
-#             if line.startswith('TAG:'):
-#                 parts = line.split('|')
-#                 if len(parts) >= 3:
-#                     tag_name = parts[0].replace('TAG:', '').strip()
-#                     confidence = parts[1].replace('CONFIDENCE:', '').strip().lower()
-#                     cluster = parts[2].replace('CLUSTER:', '').strip()
-#                     tags.append({
-#                         "name": tag_name,
-#                         "confidence": confidence,
-#                         "cluster": cluster,
-#                         "is_new": tag_name.lower() not in [t.lower() for t in (existing_tags or [])]
-#                     })
-        
-#         return tags[:7]
-#     except Exception as e:
-#         logger.error(f"Smart tags error: {e}")
-#         return []
 
 # async def generate_action_items(title: str, url: str, platform: str, notes: str = "") -> List[Dict[str, Any]]:
 #     """Turn saved content into actionable tasks - PREMIUM FEATURE"""
@@ -941,54 +1015,58 @@ PLATFORM_COLLECTIONS = {
     
 #     return {"summary": summary}
 
-# @api_router.post("/items/{item_id}/extract-ideas")
-# async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
-#     """Extract key ideas from an item - PREMIUM FEATURE"""
-#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-#     if not item:
-#         raise HTTPException(status_code=404, detail="Item not found")
+@api_router.post("/items/{item_id}/extract-ideas")
+async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Extract key ideas from an item - PREMIUM FEATURE"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_pro(current_user)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
     
-#     ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
+    ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
     
-#     if ideas:
-#         await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
+    if ideas:
+        await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
     
-#     return {"ideas": ideas}
+    return {"ideas": ideas}
 
-# @api_router.post("/items/{item_id}/smart-tags")
-# async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
-#     """Generate smart tag suggestions - PREMIUM FEATURE"""
-#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-#     if not item:
-#         raise HTTPException(status_code=404, detail="Item not found")
+@api_router.post("/items/{item_id}/smart-tags")
+async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(get_current_user)):
+    """Generate smart tag suggestions - PREMIUM FEATURE"""
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_pro(current_user)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
     
-#     tags = await generate_smart_tags(
-#         item.get("title", ""), 
-#         item.get("url", ""), 
-#         item.get("platform", "Web"),
-#         item.get("tags", [])
-#     )
+    tags = await generate_smart_tags(
+        item.get("title", ""), 
+        item.get("url", ""), 
+        item.get("platform", "Web"),
+        item.get("tags", [])
+    )
     
-#     return {"suggested_tags": tags}
+    return {"suggested_tags": tags}
 
-# @api_router.post("/items/{item_id}/action-items")
-# async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
-#     """Generate action items from content - PREMIUM FEATURE"""
-#     item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
-#     if not item:
-#         raise HTTPException(status_code=404, detail="Item not found")
-    
-#     actions = await generate_action_items(
-#         item.get("title", ""), 
-#         item.get("url", ""), 
-#         item.get("platform", "Web"),
-#         item.get("notes", "")
-#     )
-    
-#     if actions:
-#         await db.items.update_one({"id": item_id}, {"$set": {"action_items": actions}})
-    
-#     return {"action_items": actions}
+@api_router.post("/items/{item_id}/action-items")
+async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    require_pro(current_user)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    actions = await generate_action_items(
+        title=item.get("title", ""),
+        platform=item.get("platform", "Web"),
+        notes=item.get("notes", ""),
+    )
+
+    if actions:
+        await db.items.update_one(
+            {"id": item_id},
+            {"$set": {"action_items": actions}}
+        )
+
+    return {"action_items": actions}
 
 @api_router.put("/items/{item_id}/action-items/{action_index}/toggle")
 async def toggle_action_item(item_id: str, action_index: int, current_user: dict = Depends(get_current_user)):
@@ -1021,11 +1099,30 @@ async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depe
     return {"tags": current_tags}
 
 @api_router.get("/items/{item_id}/suggest-collection")
-async def get_collection_suggestion(item_id: str, current_user: dict = Depends(get_current_user)):
-    return {
+async def get_collection_suggestion(
+    item_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    require_pro(current_user)
+
+    item = await db.items.find_one({"id": item_id, "user_id": current_user["id"]})
+    if not item:
+        raise HTTPException(404, "Item not found")
+
+    collections = await db.collections.find(
+        {"user_id": current_user["id"]}
+    ).to_list(50)
+
+    result = await suggest_auto_collection(
+        item["title"],
+        item["platform"],
+        [c["name"] for c in collections],
+    )
+
+    return result or {
         "collection_name": "General",
-        "reason": "AI disabled",
-        "is_new": True
+        "reason": "Fallback",
+        "is_new": True,
     }
 
 @api_router.get("/insights", response_model=InsightsResponse)
@@ -1085,7 +1182,15 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         })
     
     
-    weekly_summary = None  # Placeholder since AI function is commented out
+    weekly_items = await db.items.find(
+        {"user_id": user_id, "created_at": {"$gte": week_ago}}
+    ).to_list(10)
+
+    weekly_summary = (
+        await generate_weekly_summary(weekly_items)
+        if current_user.get("is_pro")
+        else None
+    )
     
     return InsightsResponse(
         total_items=total_items,
@@ -1541,6 +1646,16 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
         })
     
     return {"reminders": reminders, "total": len(reminders)}
+
+@api_router.post("/items/{item_id}/ai-summary")
+async def generate_item_summary(
+    item_id: str,
+    bg: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    require_pro(current_user)
+    bg.add_task(run_ai_summary_job, item_id, current_user["id"])
+    return {"status": "processing"}
 
 # ============== Health Check ==============
 
