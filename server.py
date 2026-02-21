@@ -29,7 +29,7 @@ from fastapi import BackgroundTasks
 from fastapi import HTTPException
 
 
-assert os.environ.get("OPENAI_API_KEY"), "Missing OPENAI_API_KEY"
+assert os.environ.get("OPENAI_API_KEY"),
 
 
 mongo_url = os.environ.get("MONGO_URL")
