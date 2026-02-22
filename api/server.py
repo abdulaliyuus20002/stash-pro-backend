@@ -499,6 +499,8 @@ async def create_item(
     item_data: SavedItemCreate,
     current_user: dict = Depends(get_current_user),
 ):
+    db = get_db()  # ✅ FIX: always initialize db first
+
     # Fetch metadata if not provided
     if not item_data.title or not item_data.platform:
         metadata = await fetch_url_metadata(item_data.url)
@@ -530,7 +532,6 @@ async def create_item(
 
     if limits["max_items"] != -1 and item_data.collections:
         for collection_id in item_data.collections:
-            db = get_db()
             count = await db.items.count_documents({
                 "user_id": current_user["id"],
                 "collections": collection_id
@@ -553,7 +554,6 @@ async def create_item(
     # ================= AUTO COLLECTION (PRO ONLY) =================
     if is_pro_user(current_user):
         try:
-            db = get_db()
             collections = await db.collections.find(
                 {"user_id": current_user["id"]}
             ).to_list(50)
@@ -576,7 +576,6 @@ async def create_item(
                         collection_id = existing["id"]
                 else:
                     collection_id = str(uuid.uuid4())
-                    db = get_db()
                     await db.collections.insert_one({
                         "id": collection_id,
                         "user_id": current_user["id"],
@@ -586,7 +585,6 @@ async def create_item(
                     })
 
                 if collection_id:
-                    db = get_db()
                     await db.items.update_one(
                         {"id": item_id},
                         {"$set": {"collections": [collection_id]}}
