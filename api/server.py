@@ -43,17 +43,12 @@ client = None
 db = None
 
 def get_db():
-    global client, db
+    mongo_url = os.environ.get("MONGO_URL")
+    if not mongo_url:
+        raise RuntimeError("Database not configured")
 
-    if db is None:
-        mongo_url = os.environ.get("MONGO_URL")
-        if not mongo_url:
-            raise HTTPException(status_code=500, detail="Database not configured")
-
-        client = AsyncIOMotorClient(mongo_url)
-        db = client[os.environ.get("DB_NAME", "stash_db")]
-
-    return db
+    client = AsyncIOMotorClient(mongo_url)
+    return client[os.environ.get("DB_NAME", "stash_db")]
 
 
 
@@ -263,7 +258,10 @@ async def run_ai_summary_job(item_id: str, user_id: str):
 
 # ============== Auth Helpers ==============
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256"],
+    deprecated="auto"
+)
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
@@ -421,7 +419,6 @@ async def register(user_data: UserCreate):
         "plan_type": "free",
         "created_at": datetime.utcnow()
     }
-    db = get_db()
     await db.users.insert_one(user)
     
     token = create_access_token(user_id)
@@ -442,7 +439,10 @@ async def login(credentials: UserLogin):
     db = get_db()
     user = await db.users.find_one({"email": credentials.email.lower()})
     
-    if not user or not verify_password(credentials.password, user["password"]):
+    if not user or not user.get("password"):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not verify_password(credentials.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     token = create_access_token(user["id"])
@@ -693,7 +693,6 @@ async def get_collections(current_user: dict = Depends(get_current_user)):
     
     result = []
     for col in collections:
-        db = get_db()
         item_count = await db.items.count_documents({
             "user_id": current_user["id"],
             "collections": col["id"]
@@ -709,10 +708,10 @@ async def update_collection(collection_id: str, data: CollectionUpdate, current_
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
     
-    db = get_db()
+    
     await db.collections.update_one({"id": collection_id}, {"$set": {"name": data.name}})
     
-    db = get_db()
+    
     updated = await db.collections.find_one({"id": collection_id})
     item_count = await db.items.count_documents({
         "user_id": current_user["id"],
@@ -729,7 +728,7 @@ async def delete_collection(collection_id: str, current_user: dict = Depends(get
         raise HTTPException(status_code=404, detail="Collection not found")
     
     # Remove collection from all items
-    db = get_db()
+    
     await db.items.update_many(
         {"user_id": current_user["id"], "collections": collection_id},
         {"$pull": {"collections": collection_id}}
@@ -1064,7 +1063,7 @@ async def extract_item_ideas(item_id: str, current_user: dict = Depends(get_curr
     ideas = await extract_ideas(item.get("title", ""), item.get("url", ""), item.get("platform", "Web"))
     
     if ideas:
-        db = get_db()
+        
         await db.items.update_one({"id": item_id}, {"$set": {"extracted_ideas": ideas}})
     
     return {"ideas": ideas}
@@ -1092,6 +1091,9 @@ async def generate_item_smart_tags(item_id: str, current_user: dict = Depends(ge
 async def generate_item_actions(item_id: str, current_user: dict = Depends(get_current_user)):
     require_ai()
     require_pro(current_user)
+
+    if not OPENAI_API_KEY:
+        return {"action_items": []}
 
     db = get_db()
     item = await db.items.find_one(
@@ -1128,7 +1130,7 @@ async def toggle_action_item(item_id: str, action_index: int, current_user: dict
         raise HTTPException(status_code=400, detail="Invalid action index")
     
     action_items[action_index]["completed"] = not action_items[action_index].get("completed", False)
-    db = get_db()
+    
     await db.items.update_one({"id": item_id}, {"$set": {"action_items": action_items}})
     
     return {"action_items": action_items}
@@ -1144,7 +1146,7 @@ async def apply_smart_tag(item_id: str, tag_name: str, current_user: dict = Depe
     current_tags = item.get("tags", [])
     if tag_name not in current_tags:
         current_tags.append(tag_name)
-        db = get_db()
+        
         await db.items.update_one({"id": item_id}, {"$set": {"tags": current_tags}})
     
     return {"tags": current_tags}
@@ -1163,7 +1165,7 @@ async def get_collection_suggestion(
         raise HTTPException(404, "Item not found")
 
     
-    db = get_db()
+    
     collections = await db.collections.find(
         {"user_id": current_user["id"]}
     ).to_list(50)
@@ -1191,7 +1193,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
     
     # Items this week
     week_ago = datetime.utcnow() - timedelta(days=7)
-    db = get_db()
+    
     items_this_week = await db.items.count_documents({
         "user_id": user_id,
         "created_at": {"$gte": week_ago}
@@ -1204,7 +1206,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         {"$sort": {"count": -1}},
         {"$limit": 5}
     ]
-    db = get_db()
+    
     top_platforms = await db.items.aggregate(platform_pipeline).to_list(5)
     
     # Top tags
@@ -1215,16 +1217,16 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
         {"$sort": {"count": -1}},
         {"$limit": 5}
     ]
-    db = get_db()
+    
     top_tags = await db.items.aggregate(tags_pipeline).to_list(5)
     
     # Collections count
-    db = get_db()
+    
     collections_count = await db.collections.count_documents({"user_id": user_id})
     
     # Resurfaced items (saved 30+ days ago)
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    db = get_db()
+    
     old_items = await db.items.find({
         "user_id": user_id,
         "created_at": {"$lte": thirty_days_ago}
@@ -1242,7 +1244,7 @@ async def get_insights(current_user: dict = Depends(get_current_user)):
             "message": f"You saved this {days_ago} days ago"
         })
     
-    db = get_db()
+    
     weekly_items = await db.items.find(
         {"user_id": user_id, "created_at": {"$gte": week_ago}}
     ).to_list(10)
@@ -1320,11 +1322,11 @@ async def delete_account(current_user: dict = Depends(get_current_user)):
     # Delete user-related data
     db = get_db()
     await db.items.delete_many({"user_id": user_id})
-    db = get_db()
+    
     await db.collections.delete_many({"user_id": user_id})
 
     # Delete user
-    db = get_db()
+    
     result = await db.users.delete_one({"id": user_id})
 
     if result.deleted_count == 0:
@@ -1363,13 +1365,13 @@ async def update_profile(
     if not update_data:
         return {"message": "No changes provided"}
 
-    db = get_db()
+    
     await db.users.update_one(
         {"id": current_user["id"]},
         {"$set": update_data}
     )
 
-    db = get_db()
+    
     updated_user = await db.users.find_one({"id": current_user["id"]})
 
     return {
@@ -1461,9 +1463,8 @@ async def get_user_plan(current_user: dict = Depends(get_current_user)):
     is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
     
     # Count current usage
-    db = get_db()
+    
     items_count = await db.items.count_documents({"user_id": current_user["id"]})
-    db = get_db()
     collections_count = await db.collections.count_documents({"user_id": current_user["id"]})
     
     limits = get_user_limits(user)
@@ -1568,7 +1569,7 @@ async def advanced_search(
         query["platform"] = platform
     if collection_id:
         query["collections"] = collection_id
-    db = get_db()
+
     items = await db.items.find(query).sort("created_at", -1).to_list(100)
     
     return {
@@ -1597,9 +1598,8 @@ async def export_vault(current_user: dict = Depends(get_current_user)):
         )
     
     # Get all user data
-    db = get_db()
+    
     items = await db.items.find({"user_id": current_user["id"]}).to_list(1000)
-    db = get_db()
     collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
     
     # Prepare export data
@@ -1663,7 +1663,7 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
     week_ago_start = week_ago.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago_end = week_ago.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    db = get_db()
+    
     
     weekly_items = await db.items.find({
         "user_id": current_user["id"],
@@ -1680,7 +1680,7 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
         })
     
     # Items with incomplete action items
-    db = get_db()
+    
     items_with_actions = await db.items.find({
         "user_id": current_user["id"],
         "action_items": {"$exists": True, "$ne": []},
@@ -1708,7 +1708,7 @@ async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
     
     # Items saved 30+ days ago (resurface)
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    db = get_db()
+    
     old_items = await db.items.find({
         "user_id": current_user["id"],
         "created_at": {"$lte": thirty_days_ago}
