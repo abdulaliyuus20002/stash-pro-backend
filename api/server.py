@@ -263,16 +263,14 @@ async def run_ai_summary_job(item_id: str, user_id: str):
 
 # ============== Auth Helpers ==============
 
-pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
-
-def _normalize_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(_normalize_password(password))
+    # bcrypt handles bytes internally
+    return pwd_context.hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(_normalize_password(password), hashed)
+    return pwd_context.verify(password, hashed)
 
 def create_access_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
