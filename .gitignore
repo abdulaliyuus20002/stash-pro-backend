@@ -5,3 +5,6 @@ __pycache__/
 venv/
 node_modules/
 .DS_Store
+# Firebase / Google Cloud secrets
+*.json
+firebase-adminsdk-*.json

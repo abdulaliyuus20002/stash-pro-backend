@@ -27,9 +27,13 @@ import asyncio
 import random
 from fastapi import BackgroundTasks
 from fastapi import HTTPException
+from passlib.exc import UnknownHashError
+from api.db.firebase import FirebaseDB
 
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+firebase_db = FirebaseDB()
 
 def require_ai():
     if not OPENAI_API_KEY:
@@ -259,7 +263,7 @@ async def run_ai_summary_job(item_id: str, user_id: str):
 # ============== Auth Helpers ==============
 
 pwd_context = CryptContext(
-    schemes=["bcrypt_sha256"],
+    schemes=["bcrypt"],
     deprecated="auto"
 )
 
@@ -294,8 +298,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        db = get_db()
-        user = await db.users.find_one({"id": user_id})
+        user = await firebase_db.get_user_by_id(user_id)
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         return user
@@ -404,8 +407,7 @@ async def fetch_url_metadata(url: str) -> dict:
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
     # Check if user exists
-    db = get_db()
-    existing = await db.users.find_one({"email": user_data.email.lower()})
+    existing = await firebase_db.get_user_by_email(user_data.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     
@@ -419,7 +421,7 @@ async def register(user_data: UserCreate):
         "plan_type": "free",
         "created_at": datetime.utcnow()
     }
-    await db.users.insert_one(user)
+    await firebase_db.create_user(user)
     
     token = create_access_token(user_id)
     
@@ -436,8 +438,7 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login", response_model=TokenResponse)
 async def login(credentials: UserLogin):
-    db = get_db()
-    user = await db.users.find_one({"email": credentials.email.lower()})
+    user = await firebase_db.get_user_by_email(credentials.email)
     
     if not user or not user.get("password"):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1306,11 +1307,10 @@ async def change_password(
 
     new_hashed = hash_password(data.new_password)
 
-    db = get_db()
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": {"password": new_hashed}}
-    )
+    await firebase_db.update_user(
+    current_user["id"],
+    {"password": new_hashed}
+)
 
     return {"message": "Password updated successfully"}
 
@@ -1327,7 +1327,7 @@ async def delete_account(current_user: dict = Depends(get_current_user)):
 
     # Delete user
     
-    result = await db.users.delete_one({"id": user_id})
+    result = await firebase_db.delete_user(user_id)
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1366,10 +1366,7 @@ async def update_profile(
         return {"message": "No changes provided"}
 
     
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": update_data}
-    )
+    await firebase_db.update_user(current_user["id"], update_data)
 
     
     updated_user = await db.users.find_one({"id": current_user["id"]})
