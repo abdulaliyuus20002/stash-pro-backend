@@ -7,4 +7,4 @@ node_modules/
 .DS_Store
 # Firebase / Google Cloud secrets
 *.json
-firebase-adminsdk-*.json
+firebase-adminsdk-*.json*.json

@@ -263,10 +263,7 @@ async def run_ai_summary_job(item_id: str, user_id: str):
 
 # ============== Auth Helpers ==============
 
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto"
-)
+pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
 def _normalize_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
