@@ -1341,18 +1341,7 @@ async def update_profile(
 ):
     update_data = {}
 
-    # Username uniqueness check
     if data.username:
-        db = get_db()
-        existing = await db.users.find_one({
-            "username": data.username.lower(),
-            "id": {"$ne": current_user["id"]}
-        })
-        if existing:
-            raise HTTPException(
-                status_code=400,
-                detail="Username already taken"
-            )
         update_data["username"] = data.username.lower()
 
     if data.name is not None:
@@ -1364,11 +1353,9 @@ async def update_profile(
     if not update_data:
         return {"message": "No changes provided"}
 
-    
     await firebase_db.update_user(current_user["id"], update_data)
 
-    
-    updated_user = await db.users.find_one({"id": current_user["id"]})
+    updated_user = await firebase_db.get_user_by_id(current_user["id"])
 
     return {
         "message": "Profile updated",
@@ -1382,6 +1369,7 @@ async def update_profile(
             "created_at": updated_user["created_at"],
         }
     }
+
 
 
 @api_router.post("/users/push-token")
