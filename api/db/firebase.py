@@ -1,16 +1,15 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
-import json
 
 # Prevent re-initialization (important for FastAPI reloads)
 if not firebase_admin._apps:
-    firebase_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 
-    if not firebase_json:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON is not set")
+    if not cred_path:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set")
 
-    cred = credentials.Certificate(json.loads(firebase_json))
+    cred = credentials.Certificate(cred_path)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
