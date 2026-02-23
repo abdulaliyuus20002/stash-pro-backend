@@ -1378,9 +1378,9 @@ async def save_push_token(
     current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": {
+    await firebase_db.update_user(
+        current_user["id"],
+        {
             "push_token": data.push_token,
             "notifications_enabled": True,
             "notification_prefs": {
@@ -1388,7 +1388,7 @@ async def save_push_token(
                 "pending_actions": True,
                 "resurface": True
             }
-        }}
+        }
     )
     return {"message": "Push token saved"}
 
@@ -1428,10 +1428,11 @@ async def update_preferences(preferences: UserPreferences, current_user: dict = 
 
 @api_router.get("/users/preferences")
 async def get_preferences(current_user: dict = Depends(get_current_user)):
-    """Get user preferences"""
     db = get_db()
-    user = await db.users.find_one({"id": current_user["id"]})
-    return user.get("preferences", {
+
+    user_doc = await db.users.find_one({"id": current_user["id"]}) or {}
+
+    return user_doc.get("preferences", {
         "save_types": [],
         "usage_goals": [],
         "onboarding_completed": False
@@ -1443,20 +1444,22 @@ async def get_preferences(current_user: dict = Depends(get_current_user)):
 async def get_user_plan(current_user: dict = Depends(get_current_user)):
     """Get user's current plan and limits"""
     db = get_db()
-    user = await db.users.find_one({"id": current_user["id"]})
-    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
+    is_pro = (
+        current_user.get("is_pro", False)
+        or current_user.get("plan_type") == "pro"
+    )
     
     # Count current usage
     
     items_count = await db.items.count_documents({"user_id": current_user["id"]})
     collections_count = await db.collections.count_documents({"user_id": current_user["id"]})
     
-    limits = get_user_limits(user)
+    limits = get_user_limits(current_user)
     
     return {
         "plan_type": "pro" if is_pro else "free",
         "is_pro": is_pro,
-        "pro_expires_at": user.get("pro_expires_at"),
+        "pro_expires_at": current_user.get("pro_expires_at"),
         "limits": limits,
         "usage": {
             "items_count": items_count,
@@ -1481,13 +1484,13 @@ async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
     pro_expires_at = datetime.utcnow() + timedelta(days=30)  # 30-day subscription
     
     db = get_db()
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": {
+    await firebase_db.update_user(
+        current_user["id"],
+        {
             "is_pro": True,
             "plan_type": "pro",
-            "pro_expires_at": pro_expires_at
-        }}
+            "pro_expires_at": pro_expires_at,
+        }
     )
     
     return {
@@ -1500,13 +1503,13 @@ async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
 async def cancel_pro(current_user: dict = Depends(get_current_user)):
     """Cancel Pro subscription"""
     db = get_db()
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": {
+    await firebase_db.update_user(
+        current_user["id"],
+        {
             "is_pro": False,
             "plan_type": "free",
             "pro_expires_at": None
-        }}
+        }
     )
     
     return {"message": "Pro subscription cancelled", "plan_type": "free"}
@@ -1523,39 +1526,41 @@ async def advanced_search(
     collection_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Advanced search with notes & tags - PRO FEATURE"""
-    db = get_db()
-    user = await db.users.find_one({"id": current_user["id"]})
-    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
-    
+    # ✅ Pro check from Firebase user
+    is_pro = (
+        current_user.get("is_pro", False)
+        or current_user.get("plan_type") == "pro"
+    )
+
     if not is_pro:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="Advanced search is a Pro feature. Upgrade to unlock."
         )
-    
-    # Build search query
+
+    db = get_db()
+
     search_conditions = []
-    
+
     if search_titles:
         search_conditions.append({"title": {"$regex": q, "$options": "i"}})
     if search_notes:
         search_conditions.append({"notes": {"$regex": q, "$options": "i"}})
     if search_tags:
         search_conditions.append({"tags": {"$regex": q, "$options": "i"}})
-    
+
     query = {
         "user_id": current_user["id"],
         "$or": search_conditions
     }
-    
+
     if platform:
         query["platform"] = platform
     if collection_id:
         query["collections"] = collection_id
 
     items = await db.items.find(query).sort("created_at", -1).to_list(100)
-    
+
     return {
         "results": [SavedItemResponse(**item) for item in items],
         "total": len(items),
@@ -1570,29 +1575,34 @@ async def advanced_search(
 
 @api_router.get("/export/vault")
 async def export_vault(current_user: dict = Depends(get_current_user)):
-    """Export all user data - PRO FEATURE"""
-    db = get_db()
-    user = await db.users.find_one({"id": current_user["id"]})
-    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
-    
+    is_pro = (
+        current_user.get("is_pro", False)
+        or current_user.get("plan_type") == "pro"
+    )
+
     if not is_pro:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="Vault export is a Pro feature. Upgrade to unlock."
         )
-    
-    # Get all user data
-    
-    items = await db.items.find({"user_id": current_user["id"]}).to_list(1000)
-    collections = await db.collections.find({"user_id": current_user["id"]}).to_list(100)
-    
-    # Prepare export data
-    export_data = {
+
+    db = get_db()
+
+    items = await db.items.find(
+        {"user_id": current_user["id"]}
+    ).to_list(1000)
+
+    collections = await db.collections.find(
+        {"user_id": current_user["id"]}
+    ).to_list(100)
+
+    return {
         "exported_at": datetime.utcnow().isoformat(),
         "user": {
-            "email": user.get("email"),
-            "name": user.get("name"),
-            "created_at": user.get("created_at").isoformat() if user.get("created_at") else None,
+            "email": current_user.get("email"),
+            "name": current_user.get("name"),
+            "created_at": current_user.get("created_at").isoformat()
+            if current_user.get("created_at") else None,
         },
         "statistics": {
             "total_items": len(items),
@@ -1602,7 +1612,8 @@ async def export_vault(current_user: dict = Depends(get_current_user)):
             {
                 "id": c["id"],
                 "name": c["name"],
-                "created_at": c["created_at"].isoformat() if c.get("created_at") else None,
+                "created_at": c["created_at"].isoformat()
+                if c.get("created_at") else None,
             }
             for c in collections
         ],
@@ -1615,31 +1626,32 @@ async def export_vault(current_user: dict = Depends(get_current_user)):
                 "notes": item.get("notes"),
                 "tags": item.get("tags", []),
                 "collections": item.get("collections", []),
-                "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
+                "created_at": item["created_at"].isoformat()
+                if item.get("created_at") else None,
                 "ai_summary": item.get("ai_summary"),
                 "action_items": item.get("action_items"),
             }
             for item in items
         ]
     }
-    
-    return export_data
+
 
 # ============== Smart Reminders (Pro Feature) ==============
 
 @api_router.get("/reminders")
 async def get_smart_reminders(current_user: dict = Depends(get_current_user)):
-    """Get smart resurfacing reminders - PRO FEATURE"""
-    db = get_db()
-    user = await db.users.find_one({"id": current_user["id"]})
-    is_pro = user.get("is_pro", False) or user.get("plan_type") == "pro"
-    
+    is_pro = (
+        current_user.get("is_pro", False)
+        or current_user.get("plan_type") == "pro"
+    )
+
     if not is_pro:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="Smart reminders is a Pro feature. Upgrade to unlock."
         )
-    
+
+    db = get_db()
     reminders = []
     
     # Items saved 7 days ago (weekly review)
