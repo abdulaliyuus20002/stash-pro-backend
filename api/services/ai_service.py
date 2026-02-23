@@ -207,7 +207,7 @@ async def generate_weekly_summary(items: list[dict]) -> str | None:
     )
 
     response = await client.chat.completions.create(
-        model=DEFAULT_MODEL,
+        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -233,7 +233,7 @@ async def suggest_auto_collection(
 ):
     try:
         response = await client.chat.completions.create(
-            model=DEFAULT_MODEL,
+            model=MODEL,
             messages=[
                 {
                     "role": "system",
