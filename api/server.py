@@ -29,6 +29,7 @@ from fastapi import BackgroundTasks
 from fastapi import HTTPException
 from passlib.exc import UnknownHashError
 from api.db.firebase import FirebaseDB
+import hashlib
 
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -267,11 +268,14 @@ pwd_context = CryptContext(
     deprecated="auto"
 )
 
+def _normalize_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return pwd_context.hash(_normalize_password(password))
 
 def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
+    return pwd_context.verify(_normalize_password(password), hashed)
 
 def create_access_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
