@@ -4,15 +4,19 @@ import os
 import json
 
 if not firebase_admin._apps:
-    firebase_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    # LOCAL: file path
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-    if not firebase_json:
-        raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT_JSON is not set"
-        )
+    # PROD (Vercel): JSON string
+    cred_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
-    # 🔥 IMPORTANT: json.loads → dict
-    cred = credentials.Certificate(json.loads(firebase_json))
+    if cred_path:
+        cred = credentials.Certificate(cred_path)
+    elif cred_json:
+        cred = credentials.Certificate(json.loads(cred_json))
+    else:
+        raise RuntimeError("Firebase credentials not configured")
+
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
@@ -20,14 +24,14 @@ db = firestore.client()
 
 class FirebaseDB:
     async def get_user_by_email(self, email: str):
-        users = (
+        docs = (
             db.collection("users")
             .where("email", "==", email.lower())
             .limit(1)
             .stream()
         )
-        for user in users:
-            return user.to_dict()
+        for doc in docs:
+            return doc.to_dict()
         return None
 
     async def get_user_by_id(self, user_id: str):
