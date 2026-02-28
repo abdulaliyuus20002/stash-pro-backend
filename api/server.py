@@ -1492,28 +1492,28 @@ async def get_user_plan(current_user: dict = Depends(get_current_user)):
         }
     }
 
-@api_router.post("/users/upgrade-pro")
-async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
-    """Upgrade user to Pro plan (simulated - in production use payment provider)"""
-    # In production, this would integrate with Stripe/RevenueCat
-    # For now, we'll simulate the upgrade
-    pro_expires_at = datetime.utcnow() + timedelta(days=30)  # 30-day subscription
+# @api_router.post("/users/upgrade-pro")
+# async def upgrade_to_pro(current_user: dict = Depends(get_current_user)):
+#     """Upgrade user to Pro plan (simulated - in production use payment provider)"""
+#     # In production, this would integrate with Stripe/RevenueCat
+#     # For now, we'll simulate the upgrade
+#     pro_expires_at = datetime.utcnow() + timedelta(days=30)  # 30-day subscription
     
-    db = get_db()
-    await firebase_db.update_user(
-        current_user["id"],
-        {
-            "is_pro": True,
-            "plan_type": "pro",
-            "pro_expires_at": pro_expires_at,
-        }
-    )
+#     db = get_db()
+#     await firebase_db.update_user(
+#         current_user["id"],
+#         {
+#             "is_pro": True,
+#             "plan_type": "pro",
+#             "pro_expires_at": pro_expires_at,
+#         }
+#     )
     
-    return {
-        "message": "Successfully upgraded to Pro!",
-        "plan_type": "pro",
-        "pro_expires_at": pro_expires_at
-    }
+#     return {
+#         "message": "Successfully upgraded to Pro!",
+#         "plan_type": "pro",
+#         "pro_expires_at": pro_expires_at
+#     }
 
 @api_router.post("/users/cancel-pro")
 async def cancel_pro(current_user: dict = Depends(get_current_user)):
@@ -1965,6 +1965,21 @@ async def handle_invoice_paid(invoice):
         }}
     )
 
+    subscription_id = invoice["subscription"]
+    subscription = stripe.Subscription.retrieve(subscription_id)
+
+    customer_id = subscription["customer"]
+    user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
+
+    if user:
+        await firebase_db.update_user(user["id"], {
+            "is_pro": True,
+            "plan_type": "pro",
+            "pro_expires_at": datetime.utcfromtimestamp(
+                subscription["current_period_end"]
+            )
+        })
+
 
 async def handle_invoice_failed(invoice):
     db = get_db()
@@ -1976,6 +1991,18 @@ async def handle_invoice_failed(invoice):
             "updated_at": datetime.utcnow()
         }}
     )
+
+    subscription_id = invoice["subscription"]
+    subscription = stripe.Subscription.retrieve(subscription_id)
+
+    customer_id = subscription["customer"]
+    user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
+
+    if user:
+        await firebase_db.update_user(user["id"], {
+            "is_pro": False,
+            "plan_type": "free"
+        })
 
 
 async def handle_subscription_canceled(subscription):
@@ -1989,10 +2016,12 @@ async def handle_subscription_canceled(subscription):
         }}
     )
 
-    user_id = subscription["metadata"].get("user_id")
+    customer_id = subscription["customer"]
 
-    if user_id:
-        await firebase_db.update_user(user_id, {
+    user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
+
+    if user:
+        await firebase_db.update_user(user["id"], {
             "is_pro": False,
             "plan_type": "free",
             "pro_expires_at": None
@@ -2012,6 +2041,18 @@ async def handle_subscription_updated(subscription):
             "updated_at": datetime.utcnow()
         }}
     )
+    customer_id = subscription["customer"]
+
+    user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
+
+    if user:
+        await firebase_db.update_user(user["id"], {
+            "is_pro": subscription["status"] == "active",
+            "plan_type": "pro" if subscription["status"] == "active" else "free",
+            "pro_expires_at": datetime.utcfromtimestamp(
+                subscription["current_period_end"]
+            )
+        })
 
 # ============== Health Check ==============
 
