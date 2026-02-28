@@ -1911,9 +1911,16 @@ async def handle_checkout_completed(session):
     existing = await db.subscriptions.find_one({
         "stripe_subscription_id": subscription.id
     })
-
     if existing:
-        return  # Prevent duplicates
+        return
+
+    # ✅ SAFE ACCESS (this is the fix)
+    current_period_start = subscription.get("current_period_start")
+    current_period_end = subscription.get("current_period_end")
+
+    price_id = None
+    if subscription.get("items") and subscription["items"]["data"]:
+        price_id = subscription["items"]["data"][0]["price"]["id"]
 
     doc = {
         "id": str(uuid.uuid4()),
@@ -1921,16 +1928,18 @@ async def handle_checkout_completed(session):
 
         "stripe_customer_id": customer_id,
         "stripe_subscription_id": subscription.id,
-        "stripe_price_id": subscription["items"]["data"][0]["price"]["id"],
+        "stripe_price_id": price_id,
 
         "plan": plan,
         "status": subscription.status,
 
-        "current_period_start": datetime.utcfromtimestamp(
-            subscription.current_period_start
+        "current_period_start": (
+            datetime.utcfromtimestamp(current_period_start)
+            if current_period_start else None
         ),
-        "current_period_end": datetime.utcfromtimestamp(
-            subscription.current_period_end
+        "current_period_end": (
+            datetime.utcfromtimestamp(current_period_end)
+            if current_period_end else None
         ),
 
         "cancel_at_period_end": subscription.cancel_at_period_end,
@@ -1941,6 +1950,7 @@ async def handle_checkout_completed(session):
 
     await db.subscriptions.insert_one(doc)
 
+    # ✅ USER UPDATE WILL NOW ALWAYS RUN
     await firebase_db.update_user(user_id, {
         "is_pro": True,
         "plan_type": "pro",
