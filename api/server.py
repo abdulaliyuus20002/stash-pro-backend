@@ -1872,21 +1872,21 @@ async def stripe_webhook(request: Request):
     try:
         if event_type == "checkout.session.completed":
             await handle_checkout_completed(data)
-
         elif event_type == "invoice.payment_succeeded":
             await handle_invoice_paid(data)
-
         elif event_type == "invoice.payment_failed":
             await handle_invoice_failed(data)
-
         elif event_type == "customer.subscription.deleted":
             await handle_subscription_canceled(data)
-
         elif event_type == "customer.subscription.updated":
             await handle_subscription_updated(data)
 
-        # ✅ Mark event processed ONLY after success
-        await mark_event_processed(event)
+            # ✅ Mark event processed ONLY after success
+            await mark_event_processed(event)
+    except Exception as e:
+        logger.error(f"Webhook handler error ({event_type}): {e}")
+
+        
 
     except Exception as e:
         logger.error(f"Webhook processing failed: {e}")
@@ -1921,7 +1921,7 @@ async def handle_checkout_completed(session):
 
         "stripe_customer_id": customer_id,
         "stripe_subscription_id": subscription.id,
-        "stripe_price_id": subscription.items.data[0].price.id,
+        "stripe_price_id": subscription["items"]["data"][0]["price"]["id"],
 
         "plan": plan,
         "status": subscription.status,
@@ -1955,7 +1955,11 @@ async def handle_checkout_completed(session):
 async def handle_invoice_paid(invoice):
     db = get_db()
 
-    subscription_id = invoice["subscription"]
+    subscription_id = invoice.get("subscription")
+
+    if not subscription_id:
+        logger.warning("Invoice without subscription, skipping")
+        return
 
     subscription = stripe.Subscription.retrieve(subscription_id)
 
@@ -1988,6 +1992,12 @@ async def handle_invoice_paid(invoice):
 
 async def handle_invoice_failed(invoice):
     db = get_db()
+
+    subscription_id = invoice.get("subscription")
+
+    if not subscription_id:
+        logger.warning("Invoice without subscription, skipping")
+        return
 
     await db.subscriptions.update_one(
         {"stripe_subscription_id": invoice["subscription"]},
@@ -2033,36 +2043,39 @@ async def handle_subscription_canceled(subscription):
         })
 
 async def handle_subscription_updated(subscription):
+    if not subscription or "id" not in subscription:
+        logger.warning("Invalid subscription update payload")
+        return
+
     db = get_db()
 
     await db.subscriptions.update_one(
         {"stripe_subscription_id": subscription["id"]},
         {"$set": {
             "status": subscription["status"],
-            "cancel_at_period_end": subscription["cancel_at_period_end"],
+            "cancel_at_period_end": subscription.get("cancel_at_period_end"),
             "current_period_end": datetime.utcfromtimestamp(
                 subscription["current_period_end"]
             ),
             "updated_at": datetime.utcnow()
         }}
     )
-    customer_id = subscription["customer"]
+
+    customer_id = subscription.get("customer")
+    if not customer_id:
+        return
 
     user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
+    if not user:
+        return
 
-    logger.info(f"Updating user {user_id} to PRO")
-
-    if user:
-        await firebase_db.update_user(user["id"], {
-            "is_pro": subscription["status"] == "active",
-            "plan_type": "pro" if subscription["status"] == "active" else "free",
-            "pro_expires_at": datetime.utcfromtimestamp(
-                subscription["current_period_end"]
-            )
-        })
-
-        updated_user = await firebase_db.get_user_by_id(user_id)
-        logger.info(f"User after update: {updated_user}")
+    await firebase_db.update_user(user["id"], {
+        "is_pro": subscription["status"] == "active",
+        "plan_type": "pro" if subscription["status"] == "active" else "free",
+        "pro_expires_at": datetime.utcfromtimestamp(
+            subscription["current_period_end"]
+        )
+    })
 
 # ============== Health Check ==============
 
