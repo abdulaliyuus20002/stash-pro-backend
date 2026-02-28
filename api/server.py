@@ -30,9 +30,22 @@ from fastapi import HTTPException
 from passlib.exc import UnknownHashError
 from api.db.firebase import FirebaseDB
 import hashlib
+import stripe
+from dotenv import load_dotenv
+from pathlib import Path
+from fastapi import Request
+
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(env_path)
 
 
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+MONTHLY_PRICE_ID = os.environ.get("STRIPE_PRO_MONTHLY_PRICE_ID")
+YEARLY_PRICE_ID = os.environ.get("STRIPE_PRO_YEARLY_PRICE_ID")
+
+print("MONTHLY:", os.environ.get("STRIPE_SECRET_KEY"))
+print("YEARLY:", os.environ.get("STRIPE_PRO_YEARLY_PRICE_ID"))
 
 firebase_db = FirebaseDB()
 
@@ -121,6 +134,9 @@ class TokenResponse(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
+
+class CheckoutSessionRequest(BaseModel):
+    plan: str  # "monthly" | "yearly"
 
 # Plan limits
 FREE_PLAN_LIMITS = {
@@ -1737,6 +1753,265 @@ async def generate_item_summary(
     require_pro(current_user)
     bg.add_task(run_ai_summary_job, item_id, current_user["id"])
     return {"status": "processing"}
+
+
+@api_router.post("/payments/create-checkout-session")
+async def create_checkout_session(
+    data: CheckoutSessionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    # 1️⃣ Validate plan
+    if data.plan not in ["monthly", "yearly"]:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    price_id = (
+        MONTHLY_PRICE_ID
+        if data.plan == "monthly"
+        else YEARLY_PRICE_ID
+    )
+    logger.info(f"Checkout plan={data.plan}, price_id={price_id}")
+    if not price_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe price ID not configured"
+        )
+
+    # 2️⃣ Find or create Stripe customer
+    customers = stripe.Customer.list(
+        email=current_user["email"],
+        limit=1
+    )
+
+    if customers.data:
+        customer = customers.data[0]
+    else:
+        customer = stripe.Customer.create(
+            email=current_user["email"],
+            metadata={
+                "user_id": current_user["id"]
+            }
+        )
+
+    if current_user.get("is_pro"):
+        raise HTTPException(
+            status_code=400,
+            detail="User already has an active subscription"
+        )
+
+    # 3️⃣ Create Checkout Session
+    session = stripe.checkout.Session.create(
+        customer=customer.id,
+        mode="subscription",
+        payment_method_types=["card"],
+        line_items=[
+            {
+                "price": price_id,
+                "quantity": 1
+            }
+        ],
+        success_url=os.getenv("STRIPE_SUCCESS_URL"),
+        cancel_url=os.getenv("STRIPE_CANCEL_URL"),
+        metadata={
+            "user_id": current_user["id"],
+            "plan": data.plan
+        },
+        subscription_data={
+            "metadata": {
+                "user_id": current_user["id"],
+                "plan": data.plan
+            }
+        }
+    )
+
+    # 4️⃣ Return checkout URL
+    return {
+        "checkout_url": session.url
+    }
+
+
+async def is_event_processed(event_id: str) -> bool:
+    db = get_db()
+    existing = await db.webhook_events.find_one({"id": event_id})
+    return existing is not None
+
+
+async def mark_event_processed(event: dict):
+    db = get_db()
+    await db.webhook_events.insert_one({
+        "id": event["id"],
+        "type": event["type"],
+        "created_at": datetime.utcnow(),
+    })
+
+
+@api_router.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=endpoint_secret
+        )
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Webhook error")
+
+    # 🔐 IDEMPOTENCY CHECK
+    if await is_event_processed(event["id"]):
+        logger.info(f"Duplicate webhook ignored: {event['id']}")
+        return {"status": "duplicate"}
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    try:
+        if event_type == "checkout.session.completed":
+            await handle_checkout_completed(data)
+
+        elif event_type == "invoice.payment_succeeded":
+            await handle_invoice_paid(data)
+
+        elif event_type == "invoice.payment_failed":
+            await handle_invoice_failed(data)
+
+        elif event_type == "customer.subscription.deleted":
+            await handle_subscription_canceled(data)
+
+        elif event_type == "customer.subscription.updated":
+            await handle_subscription_updated(data)
+
+        # ✅ Mark event processed ONLY after success
+        await mark_event_processed(event)
+
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {e}")
+        raise HTTPException(status_code=500, detail="Webhook handler failed")
+
+    return {"status": "success"}
+
+
+async def handle_checkout_completed(session):
+    db = get_db()
+
+    user_id = session["metadata"]["user_id"]
+    plan = session["metadata"]["plan"]
+
+    subscription_id = session["subscription"]
+    customer_id = session["customer"]
+
+    subscription = stripe.Subscription.retrieve(subscription_id)
+
+    existing = await db.subscriptions.find_one({
+        "stripe_subscription_id": subscription.id
+    })
+
+    if existing:
+        return  # Prevent duplicates
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+
+        "stripe_customer_id": customer_id,
+        "stripe_subscription_id": subscription.id,
+        "stripe_price_id": subscription.items.data[0].price.id,
+
+        "plan": plan,
+        "status": subscription.status,
+
+        "current_period_start": datetime.utcfromtimestamp(
+            subscription.current_period_start
+        ),
+        "current_period_end": datetime.utcfromtimestamp(
+            subscription.current_period_end
+        ),
+
+        "cancel_at_period_end": subscription.cancel_at_period_end,
+
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+
+    await db.subscriptions.insert_one(doc)
+
+    await firebase_db.update_user(user_id, {
+        "is_pro": True,
+        "plan_type": "pro",
+        "stripe_customer_id": customer_id,
+        "stripe_subscription_id": subscription.id,
+        "pro_expires_at": doc["current_period_end"],
+    })
+
+async def handle_invoice_paid(invoice):
+    db = get_db()
+
+    subscription_id = invoice["subscription"]
+
+    subscription = stripe.Subscription.retrieve(subscription_id)
+
+    await db.subscriptions.update_one(
+        {"stripe_subscription_id": subscription.id},
+        {"$set": {
+            "status": subscription.status,
+            "current_period_end": datetime.utcfromtimestamp(
+                subscription.current_period_end
+            ),
+            "updated_at": datetime.utcnow()
+        }}
+    )
+
+
+async def handle_invoice_failed(invoice):
+    db = get_db()
+
+    await db.subscriptions.update_one(
+        {"stripe_subscription_id": invoice["subscription"]},
+        {"$set": {
+            "status": "past_due",
+            "updated_at": datetime.utcnow()
+        }}
+    )
+
+
+async def handle_subscription_canceled(subscription):
+    db = get_db()
+
+    await db.subscriptions.update_one(
+        {"stripe_subscription_id": subscription["id"]},
+        {"$set": {
+            "status": "canceled",
+            "updated_at": datetime.utcnow()
+        }}
+    )
+
+    user_id = subscription["metadata"].get("user_id")
+
+    if user_id:
+        await firebase_db.update_user(user_id, {
+            "is_pro": False,
+            "plan_type": "free",
+            "pro_expires_at": None
+        })
+
+async def handle_subscription_updated(subscription):
+    db = get_db()
+
+    await db.subscriptions.update_one(
+        {"stripe_subscription_id": subscription["id"]},
+        {"$set": {
+            "status": subscription["status"],
+            "cancel_at_period_end": subscription["cancel_at_period_end"],
+            "current_period_end": datetime.utcfromtimestamp(
+                subscription["current_period_end"]
+            ),
+            "updated_at": datetime.utcnow()
+        }}
+    )
 
 # ============== Health Check ==============
 

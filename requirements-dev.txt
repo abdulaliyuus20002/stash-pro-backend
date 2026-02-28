@@ -23,3 +23,173 @@ numpy>=1.26.0
 python-multipart>=0.0.9
 jq>=1.6.0
 typer>=0.9.0
+
+
+
+2. Checkout Session (Core Payment Flow)
+
+ Backend endpoint: POST /payments/create-checkout-session
+
+ Accept plan type (monthly | yearly)
+
+ Attach correct Stripe price_id
+
+ Set mode=subscription
+
+ Attach authenticated user ID to metadata
+
+ Create or reuse Stripe Customer
+
+ Return checkout_url to frontend
+
+ Frontend opens Stripe Checkout
+
+ Handle user cancellation safely
+
+✅ Result: Users can subscribe via Stripe Checkout
+
+🧠 3. Subscription State Model (Backend)
+
+ Create subscriptions table / collection
+
+ Fields:
+
+user_id
+
+stripe_customer_id
+
+stripe_subscription_id
+
+stripe_price_id
+
+status (trialing | active | past_due | canceled)
+
+current_period_end
+
+ Link subscription to user record
+
+ Prevent duplicate subscriptions
+
+✅ Result: Backend becomes the source of truth
+
+🔔 4. Stripe Webhooks (Most Important Part)
+
+ Create webhook endpoint in backend
+
+ Verify Stripe signature (STRIPE_WEBHOOK_SECRET)
+
+ Listen to critical events:
+
+checkout.session.completed
+
+customer.subscription.created
+
+customer.subscription.updated
+
+customer.subscription.deleted
+
+invoice.payment_failed
+
+invoice.payment_succeeded
+
+ Update subscription status on webhook
+
+ Log webhook failures
+
+ Idempotency protection
+
+✅ Result: Payments are trusted & secure
+
+🔄 5. Backend Subscription Sync Logic
+
+ Upgrade user on successful subscription
+
+ Downgrade user on cancellation / expiry
+
+ Handle trial expiration
+
+ Handle failed payments
+
+ Block Pro features if inactive
+
+ Handle plan upgrades/downgrades (monthly ↔ yearly)
+
+✅ Result: App always reflects Stripe state
+
+📱 6. Frontend Integration
+
+ Connect “Start Pro” button to backend
+
+ Show loading + error states
+
+ Deep link success handling
+
+ Deep link cancel handling
+
+ Refresh user subscription state after return
+
+ Lock Pro features behind subscription flag
+
+ Display current plan in Account screen
+
+🚫 7. Payment Failure & Edge Cases
+
+ Payment failed handling
+
+ Card declined handling
+
+ Trial ended handling
+
+ User closes checkout early
+
+ Webhook arrives before frontend redirect
+
+ User reinstalls app mid-subscription
+
+🔐 8. Security & Production Hardening
+
+ Never trust frontend payment status
+
+ Validate all Stripe event signatures
+
+ Separate test vs live keys
+
+ Restrict webhook endpoint
+
+ Rate limit payment endpoints
+
+ Audit logs for subscription changes
+
+🧪 9. Testing Checklist (Mandatory)
+
+ Test monthly subscription (test mode)
+
+ Test yearly subscription
+
+ Test trial → paid
+
+ Test trial → cancel
+
+ Test payment failure
+
+ Test webhook replay
+
+ Test user logout/login after payment
+
+ Test upgrade & downgrade
+
+🚀 10. Launch Readiness
+
+ Switch frontend to live publishable key
+
+ Switch backend to live secret key
+
+ Verify live webhook endpoint
+
+ Make first real $1 test payment
+
+ Confirm subscription updates backend
+
+ Confirm Pro features unlock
+
+ Monitor Stripe dashboard logs
