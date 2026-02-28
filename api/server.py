@@ -1966,13 +1966,13 @@ async def handle_invoice_paid(invoice):
     db = get_db()
 
     subscription_id = invoice.get("subscription")
-
     if not subscription_id:
         logger.warning("Invoice without subscription, skipping")
         return
 
     subscription = stripe.Subscription.retrieve(subscription_id)
 
+    # Update local subscription record
     await db.subscriptions.update_one(
         {"stripe_subscription_id": subscription.id},
         {"$set": {
@@ -1984,9 +1984,7 @@ async def handle_invoice_paid(invoice):
         }}
     )
 
-    subscription_id = invoice["subscription"]
-    subscription = stripe.Subscription.retrieve(subscription_id)
-
+    # Update user
     customer_id = subscription["customer"]
     user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
 
@@ -1995,7 +1993,7 @@ async def handle_invoice_paid(invoice):
             "is_pro": True,
             "plan_type": "pro",
             "pro_expires_at": datetime.utcfromtimestamp(
-                subscription["current_period_end"]
+                subscription.current_period_end
             )
         })
 
