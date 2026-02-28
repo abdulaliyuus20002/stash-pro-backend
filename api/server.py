@@ -1901,6 +1901,8 @@ async def handle_checkout_completed(session):
     user_id = session["metadata"]["user_id"]
     plan = session["metadata"]["plan"]
 
+    logger.info(f"Updating user {user_id} to PRO")
+
     subscription_id = session["subscription"]
     customer_id = session["customer"]
 
@@ -1946,6 +1948,9 @@ async def handle_checkout_completed(session):
         "stripe_subscription_id": subscription.id,
         "pro_expires_at": doc["current_period_end"],
     })
+
+    updated_user = await firebase_db.get_user_by_id(user_id)
+    logger.info(f"User after update: {updated_user}")
 
 async def handle_invoice_paid(invoice):
     db = get_db()
@@ -2045,6 +2050,8 @@ async def handle_subscription_updated(subscription):
 
     user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
 
+    logger.info(f"Updating user {user_id} to PRO")
+
     if user:
         await firebase_db.update_user(user["id"], {
             "is_pro": subscription["status"] == "active",
@@ -2053,6 +2060,9 @@ async def handle_subscription_updated(subscription):
                 subscription["current_period_end"]
             )
         })
+
+        updated_user = await firebase_db.get_user_by_id(user_id)
+        logger.info(f"User after update: {updated_user}")
 
 # ============== Health Check ==============
 
