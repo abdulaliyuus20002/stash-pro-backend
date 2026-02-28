@@ -363,9 +363,20 @@ def extract_suggested_tags(title: str) -> List[str]:
     return list(set(tags))
 
 async def fetch_url_metadata(url: str) -> dict:
-    """Fetch metadata from URL using OpenGraph tags"""
     platform, content_type = detect_platform(url)
-    
+
+    # ✅ SPECIAL CASE: YouTube Shorts
+    if "youtube.com/shorts/" in url:
+        video_id = url.split("/shorts/")[-1].split("?")[0]
+
+        return {
+            "title": "YouTube Short",
+            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+            "platform": "YouTube",
+            "content_type": "video",
+            "suggested_tags": ["youtube", "shorts"],
+        }
+
     default_result = {
         "title": url,
         "thumbnail_url": None,
@@ -373,19 +384,19 @@ async def fetch_url_metadata(url: str) -> dict:
         "content_type": content_type,
         "suggested_tags": []
     }
-    
+
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             response = await client.get(url, headers=headers)
-            
+
             if response.status_code != 200:
                 return default_result
-            
+
             soup = BeautifulSoup(response.text, 'html.parser')
-            
+
             # Extract title
             title = None
             og_title = soup.find('meta', property='og:title')
@@ -393,26 +404,27 @@ async def fetch_url_metadata(url: str) -> dict:
                 title = og_title['content']
             elif soup.title:
                 title = soup.title.string
-            
-            if not title:
-                title = url
-            
+
+            # 🔐 Safety fallback
+            if not title or title.strip().lower() in ["- youtube", "youtube"]:
+                title = "YouTube Video"
+
             # Extract thumbnail
             thumbnail = None
             og_image = soup.find('meta', property='og:image')
             if og_image and og_image.get('content'):
                 thumbnail = og_image['content']
-            
-            # Extract suggested tags
+
             suggested_tags = extract_suggested_tags(title)
-            
+
             return {
-                "title": title.strip()[:200] if title else url,
+                "title": title.strip()[:200],
                 "thumbnail_url": thumbnail,
                 "platform": platform,
                 "content_type": content_type,
                 "suggested_tags": suggested_tags
             }
+
     except Exception as e:
         logger.error(f"Error fetching metadata: {e}")
         return default_result
