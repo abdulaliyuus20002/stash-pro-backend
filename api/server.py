@@ -216,7 +216,7 @@ class CollectionResponse(BaseModel):
     is_auto: bool = False
 
 class MetadataResponse(BaseModel):
-    title: str
+    title: Optional[str] = None   # ✅ FIX
     thumbnail_url: Optional[str] = None
     platform: str
     content_type: str
