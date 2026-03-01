@@ -362,13 +362,31 @@ def extract_suggested_tags(title: str) -> List[str]:
     
     return list(set(tags))
 
+# ================= PLATFORM FALLBACK IMAGES =================
+
+PLATFORM_FALLBACK_IMAGES = {
+    "YouTube": "https://img.icons8.com/color/480/youtube-play.png",
+    "X": "https://img.icons8.com/color/480/twitterx.png",
+    "Instagram": "https://img.icons8.com/color/480/instagram-new.png",
+    "TikTok": "https://img.icons8.com/color/480/tiktok.png",
+    "LinkedIn": "https://img.icons8.com/color/480/linkedin.png",
+    "Medium": "https://img.icons8.com/color/480/medium-logo.png",
+    "GitHub": "https://img.icons8.com/ios-glyphs/480/github.png",
+    "Web": "https://img.icons8.com/ios-filled/500/link.png",
+}
+
 async def fetch_url_metadata(url: str) -> dict:
-    """Fetch metadata from URL using OpenGraph tags"""
+    """Fetch metadata from URL with strong fallbacks"""
+
     platform, content_type = detect_platform(url)
 
+    # Safe defaults (NEVER return empty-looking data)
+    fallback_title = urlparse(url).netloc.replace("www.", "").capitalize()
+    fallback_thumbnail = PLATFORM_FALLBACK_IMAGES.get(platform, PLATFORM_FALLBACK_IMAGES["Web"])
+
     default_result = {
-        "title": url,
-        "thumbnail_url": None,
+        "title": fallback_title,
+        "thumbnail_url": fallback_thumbnail,
         "platform": platform,
         "content_type": content_type,
         "suggested_tags": []
@@ -382,39 +400,56 @@ async def fetch_url_metadata(url: str) -> dict:
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36"
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
                 )
             }
 
             response = await client.get(url, headers=headers)
 
+            # ❌ Hard fail for bad responses
             if response.status_code != 200:
+                return default_result
+
+            html = response.text.lower()
+
+            # ❌ Detect bot-blocked or JS-only pages
+            if "enable javascript" in html or "access denied" in html:
                 return default_result
 
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # Extract title
+            # ===== TITLE EXTRACTION =====
             title = None
+
             og_title = soup.find("meta", property="og:title")
             if og_title and og_title.get("content"):
                 title = og_title["content"]
-            elif soup.title:
+
+            elif soup.title and soup.title.string:
                 title = soup.title.string
 
-            if not title:
-                title = url
+            title = title.strip() if title else fallback_title
 
-            # Extract thumbnail
+            # ===== THUMBNAIL EXTRACTION =====
             thumbnail = None
+
             og_image = soup.find("meta", property="og:image")
             if og_image and og_image.get("content"):
                 thumbnail = og_image["content"]
 
-            # Extract suggested tags
+            # 🚨 Force fallback for unreliable platforms
+            if platform in ["X", "Instagram", "TikTok"]:
+                thumbnail = PLATFORM_FALLBACK_IMAGES.get(platform)
+
+            if not thumbnail:
+                thumbnail = fallback_thumbnail
+
+            # ===== TAGS =====
             suggested_tags = extract_suggested_tags(title)
 
             return {
-                "title": title.strip()[:200] if title else url,
+                "title": title[:200],
                 "thumbnail_url": thumbnail,
                 "platform": platform,
                 "content_type": content_type,
@@ -422,7 +457,7 @@ async def fetch_url_metadata(url: str) -> dict:
             }
 
     except Exception as e:
-        logger.error(f"Error fetching metadata: {e}")
+        logger.error(f"Metadata extraction failed for {url}: {e}")
         return default_result
 
 # ============== Auth Routes ==============
