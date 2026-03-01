@@ -370,7 +370,7 @@ async def fetch_url_metadata(url: str) -> dict:
         video_id = url.split("/shorts/")[-1].split("?")[0]
 
         return {
-            "title": "YouTube Short",
+            "title": None,  # 👈 allow frontend or AI later
             "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
             "platform": "YouTube",
             "content_type": "video",
@@ -405,11 +405,17 @@ async def fetch_url_metadata(url: str) -> dict:
             elif soup.title:
                 title = soup.title.string
 
-            # 🔐 Safety fallback
-            if not title or title.strip().lower() in ["- youtube", "youtube"]:
-                title = "YouTube Video"
+            INVALID_TITLES = {
+                "- youtube",
+                "youtube",
+                "youtube -",
+                "watch - youtube",
+            }
 
-            # Extract thumbnail
+            if not title or title.strip().lower() in INVALID_TITLES:
+                title = None  
+
+
             thumbnail = None
             og_image = soup.find('meta', property='og:image')
             if og_image and og_image.get('content'):
@@ -418,7 +424,7 @@ async def fetch_url_metadata(url: str) -> dict:
             suggested_tags = extract_suggested_tags(title)
 
             return {
-                "title": title.strip()[:200],
+                "title": title.strip()[:200] if title else None,
                 "thumbnail_url": thumbnail,
                 "platform": platform,
                 "content_type": content_type,
