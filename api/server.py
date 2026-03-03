@@ -365,7 +365,7 @@ def extract_suggested_tags(title: str) -> List[str]:
 
 
 
-sync def fetch_metadata_static(url: str):
+async def fetch_metadata_static(url: str):
     """Try fast static HTML fetch first."""
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
