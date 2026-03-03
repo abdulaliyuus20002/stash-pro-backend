@@ -362,31 +362,15 @@ def extract_suggested_tags(title: str) -> List[str]:
     
     return list(set(tags))
 
-# ================= PLATFORM FALLBACK IMAGES =================
 
-PLATFORM_FALLBACK_IMAGES = {
-    "YouTube": "https://img.icons8.com/color/480/youtube-play.png",
-    "X": "https://img.icons8.com/color/480/twitterx.png",
-    "Instagram": "https://img.icons8.com/color/480/instagram-new.png",
-    "TikTok": "https://img.icons8.com/color/480/tiktok.png",
-    "LinkedIn": "https://img.icons8.com/color/480/linkedin.png",
-    "Medium": "https://img.icons8.com/color/480/medium-logo.png",
-    "GitHub": "https://img.icons8.com/ios-glyphs/480/github.png",
-    "Web": "https://img.icons8.com/ios-filled/500/link.png",
-}
 
 async def fetch_url_metadata(url: str) -> dict:
-    """Fetch metadata from URL with strong fallbacks"""
-
+    """Fetch metadata from URL using OpenGraph tags"""
     platform, content_type = detect_platform(url)
 
-    # Safe defaults (NEVER return empty-looking data)
-    fallback_title = urlparse(url).netloc.replace("www.", "").capitalize()
-    fallback_thumbnail = PLATFORM_FALLBACK_IMAGES.get(platform, PLATFORM_FALLBACK_IMAGES["Web"])
-
     default_result = {
-        "title": fallback_title,
-        "thumbnail_url": fallback_thumbnail,
+        "title": url,
+        "thumbnail_url": None,
         "platform": platform,
         "content_type": content_type,
         "suggested_tags": []
@@ -397,6 +381,7 @@ async def fetch_url_metadata(url: str) -> dict:
             timeout=10.0,
             follow_redirects=True
         ) as client:
+
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -407,19 +392,12 @@ async def fetch_url_metadata(url: str) -> dict:
 
             response = await client.get(url, headers=headers)
 
-            # ❌ Hard fail for bad responses
             if response.status_code != 200:
                 return default_result
 
-            html = response.text.lower()
+            soup = BeautifulSoup(response.text, "lxml")
 
-            # ❌ Detect bot-blocked or JS-only pages
-            if "enable javascript" in html or "access denied" in html:
-                return default_result
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # ===== TITLE EXTRACTION =====
+            # ===== Extract Title =====
             title = None
 
             og_title = soup.find("meta", property="og:title")
@@ -429,35 +407,29 @@ async def fetch_url_metadata(url: str) -> dict:
             elif soup.title and soup.title.string:
                 title = soup.title.string
 
-            title = title.strip() if title else fallback_title
+            if not title:
+                title = url
 
-            # ===== THUMBNAIL EXTRACTION =====
+            # ===== Extract Thumbnail =====
             thumbnail = None
 
             og_image = soup.find("meta", property="og:image")
             if og_image and og_image.get("content"):
                 thumbnail = og_image["content"]
 
-            # 🚨 Force fallback for unreliable platforms
-            if platform in ["X", "Instagram", "TikTok"]:
-                thumbnail = PLATFORM_FALLBACK_IMAGES.get(platform)
-
-            if not thumbnail:
-                thumbnail = fallback_thumbnail
-
-            # ===== TAGS =====
+            # ===== Extract Tags =====
             suggested_tags = extract_suggested_tags(title)
 
             return {
-                "title": title[:200],
-                "thumbnail_url": thumbnail,
+                "title": title.strip()[:200] if title else url,
+                "thumbnail_url": thumbnail,   # ← IMPORTANT: No forced fallback
                 "platform": platform,
                 "content_type": content_type,
-                "suggested_tags": suggested_tags,
+                "suggested_tags": suggested_tags
             }
 
     except Exception as e:
-        logger.error(f"Metadata extraction failed for {url}: {e}")
+        logger.error(f"Error fetching metadata: {e}")
         return default_result
 
 # ============== Auth Routes ==============
