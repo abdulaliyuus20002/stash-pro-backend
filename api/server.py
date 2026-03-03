@@ -34,6 +34,7 @@ import stripe
 from dotenv import load_dotenv
 from pathlib import Path
 from fastapi import Request
+from playwright.async_api import async_playwright
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(env_path)
@@ -364,8 +365,53 @@ def extract_suggested_tags(title: str) -> List[str]:
 
 
 
+sync def fetch_metadata_static(url: str):
+    """Try fast static HTML fetch first."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = await client.get(url, headers=headers)
+            if response.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(response.text, "lxml")
+
+            title_tag = soup.find("meta", property="og:title")
+            image_tag = soup.find("meta", property="og:image")
+
+            title = title_tag["content"] if title_tag and title_tag.get("content") else None
+            image = image_tag["content"] if image_tag and image_tag.get("content") else None
+
+            if title or image:
+                return {"title": title, "thumbnail_url": image}
+    except Exception as e:
+        pass
+
+    return None
+
+async def fetch_metadata_browser(url: str):
+    """Fallback using Playwright."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle")
+            
+            # Extract final DOM metadata
+            title = await page.evaluate(
+                "document.querySelector('meta[property=\"og:title\"]')?.content || document.title"
+            )
+            image = await page.evaluate(
+                "document.querySelector('meta[property=\"og:image\"]')?.content"
+            )
+            await browser.close()
+
+            return {"title": title, "thumbnail_url": image}
+    except Exception as e:
+        return None
+
 async def fetch_url_metadata(url: str) -> dict:
-    """Fetch metadata from URL using OpenGraph tags"""
+    """Universal metadata fetcher with fallback."""
     platform, content_type = detect_platform(url)
 
     default_result = {
@@ -376,61 +422,27 @@ async def fetch_url_metadata(url: str) -> dict:
         "suggested_tags": []
     }
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True
-        ) as client:
+    # Try fast static first
+    result = await fetch_metadata_static(url)
+    if not result or not (result.get("title") or result.get("thumbnail_url")):
+        # Fallback to browser
+        result = await fetch_metadata_browser(url)
 
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                )
-            }
-
-            response = await client.get(url, headers=headers)
-
-            if response.status_code != 200:
-                return default_result
-
-            soup = BeautifulSoup(response.text, "lxml")
-
-            # ===== Extract Title =====
-            title = None
-
-            og_title = soup.find("meta", property="og:title")
-            if og_title and og_title.get("content"):
-                title = og_title["content"]
-
-            elif soup.title and soup.title.string:
-                title = soup.title.string
-
-            if not title:
-                title = url
-
-            # ===== Extract Thumbnail =====
-            thumbnail = None
-
-            og_image = soup.find("meta", property="og:image")
-            if og_image and og_image.get("content"):
-                thumbnail = og_image["content"]
-
-            # ===== Extract Tags =====
-            suggested_tags = extract_suggested_tags(title)
-
-            return {
-                "title": title.strip()[:200] if title else url,
-                "thumbnail_url": thumbnail,   # ← IMPORTANT: No forced fallback
-                "platform": platform,
-                "content_type": content_type,
-                "suggested_tags": suggested_tags
-            }
-
-    except Exception as e:
-        logger.error(f"Error fetching metadata: {e}")
+    if not result:
         return default_result
+
+    title = result.get("title") or url
+    thumbnail = result.get("thumbnail_url")
+
+    tags = extract_suggested_tags(title or "")
+
+    return {
+        "title": title.strip()[:200],
+        "thumbnail_url": thumbnail,
+        "platform": platform,
+        "content_type": content_type,
+        "suggested_tags": tags
+    }
 
 # ============== Auth Routes ==============
 
