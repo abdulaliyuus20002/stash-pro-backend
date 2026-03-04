@@ -373,9 +373,11 @@ async def resolve_url(url: str) -> str:
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
             }
-        )
+        ) as client:
+
             r = await client.get(url)
             return str(r.url)
+
     except Exception:
         return url
 
