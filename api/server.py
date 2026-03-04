@@ -365,29 +365,29 @@ def extract_suggested_tags(title: str) -> List[str]:
 
 
 
-async def fetch_metadata_static(url: str):
-    """Try fast static HTML fetch first."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = await client.get(url, headers=headers)
-            if response.status_code != 200:
-                return None
+# async def fetch_metadata_static(url: str):
+#     """Try fast static HTML fetch first."""
+#     try:
+#         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+#             headers = {"User-Agent": "Mozilla/5.0"}
+#             response = await client.get(url, headers=headers)
+#             if response.status_code != 200:
+#                 return None
 
-            soup = BeautifulSoup(response.text, "lxml")
+#             soup = BeautifulSoup(response.text, "lxml")
 
-            title_tag = soup.find("meta", property="og:title")
-            image_tag = soup.find("meta", property="og:image")
+#             title_tag = soup.find("meta", property="og:title")
+#             image_tag = soup.find("meta", property="og:image")
 
-            title = title_tag["content"] if title_tag and title_tag.get("content") else None
-            image = image_tag["content"] if image_tag and image_tag.get("content") else None
+#             title = title_tag["content"] if title_tag and title_tag.get("content") else None
+#             image = image_tag["content"] if image_tag and image_tag.get("content") else None
 
-            if title or image:
-                return {"title": title, "thumbnail_url": image}
-    except Exception as e:
-        pass
+#             if title or image:
+#                 return {"title": title, "thumbnail_url": image}
+#     except Exception as e:
+#         pass
 
-    return None
+#     return None
 
 async def fetch_metadata_browser(url: str):
     """Fallback using Playwright."""
@@ -409,6 +409,52 @@ async def fetch_metadata_browser(url: str):
             return {"title": title, "thumbnail_url": image}
     except Exception as e:
         return None
+
+
+async def fetch_url_metadata(url: str) -> dict:
+    """Main metadata extraction pipeline"""
+    
+    platform, content_type = detect_platform(url)
+
+    default_result = {
+        "title": url,
+        "thumbnail_url": None,
+        "platform": platform,
+        "content_type": content_type,
+        "suggested_tags": []
+    }
+
+    try:
+        # 1️⃣ Try fast static extraction
+        static_data = await fetch_metadata_static(url)
+
+        if static_data and (static_data.get("title") or static_data.get("thumbnail_url")):
+            title = static_data.get("title") or url
+            thumbnail = static_data.get("thumbnail_url")
+
+        else:
+            # 2️⃣ Fallback to browser rendering
+            browser_data = await fetch_metadata_browser(url)
+
+            if not browser_data:
+                return default_result
+
+            title = browser_data.get("title") or url
+            thumbnail = browser_data.get("thumbnail_url")
+
+        suggested_tags = extract_suggested_tags(title)
+
+        return {
+            "title": title[:200],
+            "thumbnail_url": thumbnail,
+            "platform": platform,
+            "content_type": content_type,
+            "suggested_tags": suggested_tags
+        }
+
+    except Exception as e:
+        logger.error(f"Metadata extraction error: {e}")
+        return default_result
 
 async def fetch_metadata_static(url: str):
     """Universal metadata extractor."""
