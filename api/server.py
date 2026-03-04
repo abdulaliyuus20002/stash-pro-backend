@@ -445,7 +445,7 @@ async def fetch_metadata_browser(url: str):
 
             page = await context.new_page()
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             await page.wait_for_timeout(1500)
 
