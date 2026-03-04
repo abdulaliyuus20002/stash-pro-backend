@@ -17,3 +17,4 @@ firebase-admin>=6.4.0
 stripe>=8.0.0
 gunicorn>=21.2.0
 playwright>=1.42.0
+lxml
