@@ -410,39 +410,63 @@ async def fetch_metadata_browser(url: str):
     except Exception as e:
         return None
 
-async def fetch_url_metadata(url: str) -> dict:
-    """Universal metadata fetcher with fallback."""
-    platform, content_type = detect_platform(url)
+async def fetch_metadata_static(url: str):
+    """Universal metadata extractor."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            }
 
-    default_result = {
-        "title": url,
-        "thumbnail_url": None,
-        "platform": platform,
-        "content_type": content_type,
-        "suggested_tags": []
-    }
+            response = await client.get(url, headers=headers)
 
-    # Try fast static first
-    result = await fetch_metadata_static(url)
-    if not result or not (result.get("title") or result.get("thumbnail_url")):
-        # Fallback to browser
-        result = await fetch_metadata_browser(url)
+            if response.status_code != 200:
+                return None
 
-    if not result:
-        return default_result
+            soup = BeautifulSoup(response.text, "lxml")
 
-    title = result.get("title") or url
-    thumbnail = result.get("thumbnail_url")
+            title = None
+            image = None
 
-    tags = extract_suggested_tags(title or "")
+            # -------- TITLE FALLBACKS --------
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                title = og_title["content"]
 
-    return {
-        "title": title.strip()[:200],
-        "thumbnail_url": thumbnail,
-        "platform": platform,
-        "content_type": content_type,
-        "suggested_tags": tags
-    }
+            if not title:
+                twitter_title = soup.find("meta", attrs={"name": "twitter:title"})
+                if twitter_title and twitter_title.get("content"):
+                    title = twitter_title["content"]
+
+            if not title:
+                meta_title = soup.find("meta", attrs={"name": "title"})
+                if meta_title and meta_title.get("content"):
+                    title = meta_title["content"]
+
+            if not title and soup.title:
+                title = soup.title.string
+
+            # -------- IMAGE FALLBACKS --------
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                image = og_image["content"]
+
+            if not image:
+                twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
+                if twitter_image and twitter_image.get("content"):
+                    image = twitter_image["content"]
+
+            if title or image:
+                return {
+                    "title": title,
+                    "thumbnail_url": image
+                }
+
+    except Exception as e:
+        logger.error(f"Static metadata error: {e}")
+
+    return None
 
 # ============== Auth Routes ==============
 
