@@ -365,96 +365,153 @@ def extract_suggested_tags(title: str) -> List[str]:
 
 
 
-# async def fetch_metadata_static(url: str):
-#     """Try fast static HTML fetch first."""
-#     try:
-#         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-#             headers = {"User-Agent": "Mozilla/5.0"}
-#             response = await client.get(url, headers=headers)
-#             if response.status_code != 200:
-#                 return None
+async def resolve_url(url: str) -> str:
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            }
+        )
+            r = await client.get(url)
+            return str(r.url)
+    except Exception:
+        return url
 
-#             soup = BeautifulSoup(response.text, "lxml")
+def extract_youtube_video_id(url: str):
+    patterns = [
+        r"youtu\.be/([^?&]+)",
+        r"youtube\.com/watch\?v=([^&]+)",
+        r"youtube\.com/shorts/([^?&]+)"
+    ]
 
-#             title_tag = soup.find("meta", property="og:title")
-#             image_tag = soup.find("meta", property="og:image")
+    for p in patterns:
+        match = re.search(p, url)
+        if match:
+            return match.group(1)
 
-#             title = title_tag["content"] if title_tag and title_tag.get("content") else None
-#             image = image_tag["content"] if image_tag and image_tag.get("content") else None
+    return None
 
-#             if title or image:
-#                 return {"title": title, "thumbnail_url": image}
-#     except Exception as e:
-#         pass
+async def handle_youtube(url: str):
 
-#     return None
+    video_id = extract_youtube_video_id(url)
+
+    if not video_id:
+        return None
+
+    thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+
+    title = None
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            soup = BeautifulSoup(r.text, "lxml")
+
+            if soup.title:
+                title = soup.title.string.replace("- YouTube", "").strip()
+
+    except Exception:
+        pass
+
+    return {
+        "title": title or "YouTube Video",
+        "thumbnail_url": thumbnail,
+        "platform": "YouTube",
+        "content_type": "video",
+        "suggested_tags": ["youtube", "video"]
+    }
 
 async def fetch_metadata_browser(url: str):
-    """Fallback using Playwright."""
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle")
-            
-            # Extract final DOM metadata
-            title = await page.evaluate(
-                "document.querySelector('meta[property=\"og:title\"]')?.content || document.title"
+
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox"
+                ]
             )
-            image = await page.evaluate(
-                "document.querySelector('meta[property=\"og:image\"]')?.content"
+
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
             )
+
+            page = await context.new_page()
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+            await page.wait_for_timeout(1500)
+
+            title = await page.evaluate("""
+                document.querySelector('meta[property="og:title"]')?.content
+                || document.querySelector('meta[name="twitter:title"]')?.content
+                || document.title
+            """)
+
+            image = await page.evaluate("""
+                document.querySelector('meta[property="og:image"]')?.content
+                || document.querySelector('meta[name="twitter:image"]')?.content
+            """)
+
             await browser.close()
 
-            return {"title": title, "thumbnail_url": image}
+            return {
+                "title": title,
+                "thumbnail_url": image
+            }
+
     except Exception as e:
+        logger.error(f"Browser extraction error: {e}")
         return None
 
 
-async def fetch_url_metadata(url: str) -> dict:
-    """Main metadata extraction pipeline"""
-    
+async def fetch_url_metadata(url: str):
+
+    # Resolve redirect links first
+    url = await resolve_url(url)
+
     platform, content_type = detect_platform(url)
 
-    default_result = {
-        "title": url,
-        "thumbnail_url": None,
+    # SPECIAL HANDLERS
+    if platform == "YouTube":
+        yt = await handle_youtube(url)
+        if yt:
+            return yt
+
+    # NORMAL SCRAPING
+    title = None
+    image = None
+
+    static_data = await fetch_metadata_static(url)
+
+    if static_data:
+        title = static_data.get("title")
+        image = static_data.get("thumbnail_url")
+
+    if (not title or not image):
+        browser_data = await fetch_metadata_browser(url)
+
+        if browser_data:
+            title = title or browser_data.get("title")
+            image = image or browser_data.get("thumbnail_url")
+
+    if not title:
+        title = urlparse(url).netloc
+
+    tags = extract_suggested_tags(title)
+
+    return {
+        "title": title,
+        "thumbnail_url": image,
         "platform": platform,
         "content_type": content_type,
-        "suggested_tags": []
+        "suggested_tags": tags
     }
-
-    try:
-        # 1️⃣ Try fast static extraction
-        static_data = await fetch_metadata_static(url)
-
-        if static_data and (static_data.get("title") or static_data.get("thumbnail_url")):
-            title = static_data.get("title") or url
-            thumbnail = static_data.get("thumbnail_url")
-
-        else:
-            # 2️⃣ Fallback to browser rendering
-            browser_data = await fetch_metadata_browser(url)
-
-            if not browser_data:
-                return default_result
-
-            title = browser_data.get("title") or url
-            thumbnail = browser_data.get("thumbnail_url")
-
-        suggested_tags = extract_suggested_tags(title)
-
-        return {
-            "title": title[:200],
-            "thumbnail_url": thumbnail,
-            "platform": platform,
-            "content_type": content_type,
-            "suggested_tags": suggested_tags
-        }
-
-    except Exception as e:
-        logger.error(f"Metadata extraction error: {e}")
-        return default_result
 
 async def fetch_metadata_static(url: str):
     """Universal metadata extractor."""
@@ -486,9 +543,10 @@ async def fetch_metadata_static(url: str):
                     title = twitter_title["content"]
 
             if not title:
-                meta_title = soup.find("meta", attrs={"name": "title"})
-                if meta_title and meta_title.get("content"):
-                    title = meta_title["content"]
+                meta = soup.find("meta", property="og:title")
+
+                if meta and meta.get("content"):
+                    title = meta["content"].replace(" - YouTube", "").strip()
 
             if not title and soup.title:
                 title = soup.title.string
