@@ -470,7 +470,7 @@ async def fetch_metadata_static(url: str):
             if response.status_code != 200:
                 return None
 
-            soup = BeautifulSoup(response.text, "lxml")
+            soup = BeautifulSoup(response.text, "html.parser")
 
             title = None
             image = None
