@@ -495,6 +495,26 @@ async def fetch_url_metadata(url: str):
         title = static_data.get("title")
         image = static_data.get("thumbnail_url")
 
+    # Detect bad metadata
+    bad_title_patterns = [
+        "TikTok - Make Your Day",
+        "Instagram",
+        "YouTube",
+    ]
+
+    needs_browser = (
+        not title
+        or not image
+        or title in bad_title_patterns
+    )
+
+    if needs_browser:
+        browser_data = await fetch_metadata_browser(url)
+
+    if browser_data:
+        title = browser_data.get("title") or title
+        image = browser_data.get("thumbnail_url") or image
+
     if (not title or not image):
         browser_data = await fetch_metadata_browser(url)
 
