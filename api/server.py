@@ -402,23 +402,32 @@ async def handle_youtube(url: str):
     if not video_id:
         return None
 
-    thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+    thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
     title = None
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
-            soup = BeautifulSoup(r.text, "lxml")
 
-            if soup.title:
-                title = soup.title.string.replace("- YouTube", "").strip()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            if soup.title and soup.title.string:
+                raw_title = soup.title.string.strip()
+
+                if raw_title.endswith(" - YouTube"):
+                    title = raw_title.replace(" - YouTube", "").strip()
+                else:
+                    title = raw_title
 
     except Exception:
         pass
 
+    if not title or title.lower() == "youtube":
+        title = "YouTube Video"
+
     return {
-        "title": title or "YouTube Video",
+        "title": title,
         "thumbnail_url": thumbnail,
         "platform": "YouTube",
         "content_type": "video",
@@ -432,22 +441,21 @@ async def fetch_metadata_browser(url: str):
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
-                    "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                    "--disable-setuid-sandbox"
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
                 ]
             )
 
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
             )
 
             page = await context.new_page()
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=45000)
 
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
             title = await page.evaluate("""
                 document.querySelector('meta[property="og:title"]')?.content
