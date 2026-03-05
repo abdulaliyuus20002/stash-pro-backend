@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 from fastapi import Request
 from playwright.async_api import async_playwright
+import yt_dlp
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(env_path)
@@ -397,42 +398,58 @@ def extract_youtube_video_id(url: str):
 
 async def handle_youtube(url: str):
 
-    video_id = extract_youtube_video_id(url)
+    try:
 
-    if not video_id:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        return {
+            "title": info.get("title") or "YouTube Video",
+            "thumbnail_url": info.get("thumbnail"),
+            "platform": "YouTube",
+            "content_type": "video",
+            "suggested_tags": ["youtube", "video"]
+        }
+
+    except Exception as e:
+        logger.error(f"YouTube extraction failed: {e}")
         return None
 
-    thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-
-    title = None
+async def handle_tiktok(url: str):
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
 
-            soup = BeautifulSoup(r.text, "html.parser")
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "nocheckcertificate": True
+        }
 
-            if soup.title and soup.title.string:
-                raw_title = soup.title.string.strip()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-                if raw_title.endswith(" - YouTube"):
-                    title = raw_title.replace(" - YouTube", "").strip()
-                else:
-                    title = raw_title
+        title = info.get("title")
+        thumbnail = info.get("thumbnail")
 
-    except Exception:
-        pass
+        if not title:
+            title = "TikTok Video"
 
-    if not title or title.lower() == "youtube":
-        title = "YouTube Video"
+        return {
+            "title": title,
+            "thumbnail_url": thumbnail,
+            "platform": "TikTok",
+            "content_type": "video",
+            "suggested_tags": ["tiktok", "video"]
+        }
 
-    return {
-        "title": title,
-        "thumbnail_url": thumbnail,
-        "platform": "YouTube",
-        "content_type": "video",
-        "suggested_tags": ["youtube", "video"]
-    }
+    except Exception as e:
+        logger.error(f"TikTok extraction failed: {e}")
+        return None
 
 
 
@@ -454,7 +471,7 @@ async def fetch_metadata_browser(url: str):
             page = await context.new_page()
 
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            
+
             try:
                 await page.wait_for_selector('meta[property="og:title"]', timeout=5000)
             except:
@@ -501,14 +518,21 @@ async def fetch_url_metadata(url: str):
 
     platform, content_type = detect_platform(url)
 
+    title = None
+    image = None
+
     # 1️⃣ Special handler
     if platform == "YouTube":
         yt = await handle_youtube(url)
         if yt:
             return yt
 
-    title = None
-    image = None
+    if platform == "TikTok":
+        tk = await handle_tiktok(url)
+        if tk:
+            return tk
+
+    
 
     # 2️⃣ Fast metadata extraction
     static_data = await fetch_metadata_static(url)
