@@ -13,6 +13,7 @@ import jwt
 from passlib.context import CryptContext
 import httpx
 from bs4 import BeautifulSoup
+from opengraph import OpenGraph
 import re
 from urllib.parse import urlparse
 from .services.ai_service import (
@@ -434,6 +435,33 @@ async def handle_youtube(url: str):
         "suggested_tags": ["youtube", "video"]
     }
 
+
+async def fetch_metadata_opengraph(url: str):
+    """
+    Extract metadata using OpenGraph protocol.
+    This is the most reliable metadata system used by most platforms.
+    """
+
+    try:
+        og = OpenGraph(url)
+
+        title = og.title if hasattr(og, "title") else None
+        image = og.image if hasattr(og, "image") else None
+
+        if isinstance(image, list):
+            image = image[0]
+
+        if title or image:
+            return {
+                "title": title,
+                "thumbnail_url": image
+            }
+
+    except Exception as e:
+        logger.error(f"OpenGraph extraction error: {e}")
+
+    return None
+
 async def fetch_metadata_browser(url: str):
     try:
         async with async_playwright() as p:
@@ -482,54 +510,46 @@ async def fetch_metadata_browser(url: str):
 
 async def fetch_url_metadata(url: str):
 
-    # Resolve redirect links first
+    # Resolve redirects
     url = await resolve_url(url)
 
     platform, content_type = detect_platform(url)
 
-    # SPECIAL HANDLERS
+    # -------- SPECIAL HANDLERS --------
     if platform == "YouTube":
         yt = await handle_youtube(url)
         if yt:
             return yt
 
-    # NORMAL SCRAPING
     title = None
     image = None
 
-    static_data = await fetch_metadata_static(url)
+    # -------- 1️⃣ OPENGRAPH EXTRACTION --------
+    og_data = await fetch_metadata_opengraph(url)
 
-    if static_data:
-        title = static_data.get("title")
-        image = static_data.get("thumbnail_url")
+    if og_data:
+        title = og_data.get("title")
+        image = og_data.get("thumbnail_url")
 
-    # Detect bad metadata
-    bad_title_patterns = [
-        "TikTok - Make Your Day",
-        "Instagram",
-        "YouTube",
-    ]
+    # -------- 2️⃣ STATIC SCRAPING FALLBACK --------
+    if not title or not image:
 
-    needs_browser = (
-        not title
-        or not image
-        or title in bad_title_patterns
-    )
+        static_data = await fetch_metadata_static(url)
 
-    if needs_browser:
-        browser_data = await fetch_metadata_browser(url)
+        if static_data:
+            title = title or static_data.get("title")
+            image = image or static_data.get("thumbnail_url")
 
-    if browser_data:
-        title = browser_data.get("title") or title
-        image = browser_data.get("thumbnail_url") or image
+    # -------- 3️⃣ PLAYWRIGHT FALLBACK --------
+    if not title or not image:
 
-    if (not title or not image):
         browser_data = await fetch_metadata_browser(url)
 
         if browser_data:
             title = title or browser_data.get("title")
             image = image or browser_data.get("thumbnail_url")
 
+    # -------- FINAL FALLBACK --------
     if not title:
         title = urlparse(url).netloc
 
