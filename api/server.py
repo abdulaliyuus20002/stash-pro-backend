@@ -405,8 +405,13 @@ async def handle_youtube(url: str):
             "skip_download": True,
         }
 
+        loop = asyncio.get_event_loop()
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = await loop.run_in_executor(
+                None,
+                lambda: ydl.extract_info(url, download=False)
+            )
 
         return {
             "title": info.get("title") or "YouTube Video",
@@ -418,7 +423,32 @@ async def handle_youtube(url: str):
 
     except Exception as e:
         logger.error(f"YouTube extraction failed: {e}")
-        return None
+
+        # ✅ Fallback: scrape title from page
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url)
+
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            title = soup.title.string if soup.title else "YouTube Video"
+
+            return {
+                "title": title.replace(" - YouTube", ""),
+                "thumbnail_url": None,
+                "platform": "YouTube",
+                "content_type": "video",
+                "suggested_tags": ["youtube"]
+            }
+
+        except Exception:
+            return {
+                "title": "YouTube Video",
+                "thumbnail_url": None,
+                "platform": "YouTube",
+                "content_type": "video",
+                "suggested_tags": ["youtube"]
+            }
 
 async def handle_tiktok(url: str):
 
@@ -542,7 +572,7 @@ async def fetch_url_metadata(url: str):
         image = static_data.get("thumbnail_url")
 
     # 3️⃣ Browser fallback
-    if not title or not image:
+    if (not title or not image) and platform not in ["YouTube", "TikTok", "X"]:
 
         browser_data = await fetch_metadata_browser(url)
 
