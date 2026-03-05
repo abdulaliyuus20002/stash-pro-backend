@@ -13,7 +13,6 @@ import jwt
 from passlib.context import CryptContext
 import httpx
 from bs4 import BeautifulSoup
-from opengraph import OpenGraph
 import re
 from urllib.parse import urlparse
 from .services.ai_service import (
@@ -372,7 +371,7 @@ async def resolve_url(url: str) -> str:
             follow_redirects=True,
             timeout=10,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36"
             }
         ) as client:
 
@@ -436,33 +435,9 @@ async def handle_youtube(url: str):
     }
 
 
-async def fetch_metadata_opengraph(url: str):
-    """
-    Extract metadata using OpenGraph protocol.
-    This is the most reliable metadata system used by most platforms.
-    """
-
-    try:
-        og = OpenGraph(url)
-
-        title = og.title if hasattr(og, "title") else None
-        image = og.image if hasattr(og, "image") else None
-
-        if isinstance(image, list):
-            image = image[0]
-
-        if title or image:
-            return {
-                "title": title,
-                "thumbnail_url": image
-            }
-
-    except Exception as e:
-        logger.error(f"OpenGraph extraction error: {e}")
-
-    return None
 
 async def fetch_metadata_browser(url: str):
+
     try:
         async with async_playwright() as p:
 
@@ -470,20 +445,15 @@ async def fetch_metadata_browser(url: str):
                 headless=True,
                 args=[
                     "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled"
+                    "--disable-setuid-sandbox"
                 ]
             )
 
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            )
+            context = await browser.new_context()
 
             page = await context.new_page()
 
             await page.goto(url, wait_until="networkidle", timeout=45000)
-
-            await page.wait_for_timeout(2000)
 
             title = await page.evaluate("""
                 document.querySelector('meta[property="og:title"]')?.content
@@ -491,31 +461,42 @@ async def fetch_metadata_browser(url: str):
                 || document.title
             """)
 
+            description = await page.evaluate("""
+                document.querySelector('meta[property="og:description"]')?.content
+                || document.querySelector('meta[name="twitter:description"]')?.content
+                || document.querySelector('meta[name="description"]')?.content
+            """)
+
             image = await page.evaluate("""
                 document.querySelector('meta[property="og:image"]')?.content
                 || document.querySelector('meta[name="twitter:image"]')?.content
+            """)
+
+            site_name = await page.evaluate("""
+                document.querySelector('meta[property="og:site_name"]')?.content
             """)
 
             await browser.close()
 
             return {
                 "title": title,
-                "thumbnail_url": image
+                "thumbnail_url": image,
+                "description": description,
+                "site_name": site_name
             }
 
     except Exception as e:
-        logger.error(f"Browser extraction error: {e}")
+        logger.error(f"Browser metadata extraction failed: {e}")
         return None
 
 
 async def fetch_url_metadata(url: str):
 
-    # Resolve redirects
     url = await resolve_url(url)
 
     platform, content_type = detect_platform(url)
 
-    # -------- SPECIAL HANDLERS --------
+    # 1️⃣ Special handler
     if platform == "YouTube":
         yt = await handle_youtube(url)
         if yt:
@@ -524,23 +505,14 @@ async def fetch_url_metadata(url: str):
     title = None
     image = None
 
-    # -------- 1️⃣ OPENGRAPH EXTRACTION --------
-    og_data = await fetch_metadata_opengraph(url)
+    # 2️⃣ Fast metadata extraction
+    static_data = await fetch_metadata_static(url)
 
-    if og_data:
-        title = og_data.get("title")
-        image = og_data.get("thumbnail_url")
+    if static_data:
+        title = static_data.get("title")
+        image = static_data.get("thumbnail_url")
 
-    # -------- 2️⃣ STATIC SCRAPING FALLBACK --------
-    if not title or not image:
-
-        static_data = await fetch_metadata_static(url)
-
-        if static_data:
-            title = title or static_data.get("title")
-            image = image or static_data.get("thumbnail_url")
-
-    # -------- 3️⃣ PLAYWRIGHT FALLBACK --------
+    # 3️⃣ Browser fallback
     if not title or not image:
 
         browser_data = await fetch_metadata_browser(url)
@@ -549,7 +521,7 @@ async def fetch_url_metadata(url: str):
             title = title or browser_data.get("title")
             image = image or browser_data.get("thumbnail_url")
 
-    # -------- FINAL FALLBACK --------
+    # 4️⃣ Final fallback
     if not title:
         title = urlparse(url).netloc
 
@@ -564,63 +536,65 @@ async def fetch_url_metadata(url: str):
     }
 
 async def fetch_metadata_static(url: str):
-    """Universal metadata extractor."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            headers = {
-                "User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            }
+    """
+    Fast metadata extraction using OpenGraph and Twitter tags.
+    Works for most websites without a browser.
+    """
 
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122 Safari/537.36"
+        }
+
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
 
-            if response.status_code != 200:
-                return None
+        if response.status_code != 200:
+            return None
 
-            soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(response.text, "html.parser")
 
-            title = None
-            image = None
+        def get_meta(property_name):
+            tag = soup.find("meta", property=property_name)
+            if tag and tag.get("content"):
+                return tag["content"]
+            return None
 
-            # -------- TITLE FALLBACKS --------
-            og_title = soup.find("meta", property="og:title")
-            if og_title and og_title.get("content"):
-                title = og_title["content"]
+        def get_name(name):
+            tag = soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return tag["content"]
+            return None
 
-            if not title:
-                twitter_title = soup.find("meta", attrs={"name": "twitter:title"})
-                if twitter_title and twitter_title.get("content"):
-                    title = twitter_title["content"]
+        title = (
+            get_meta("og:title")
+            or get_name("twitter:title")
+            or (soup.title.string if soup.title else None)
+        )
 
-            if not title:
-                meta = soup.find("meta", property="og:title")
+        description = (
+            get_meta("og:description")
+            or get_name("twitter:description")
+            or get_name("description")
+        )
 
-                if meta and meta.get("content"):
-                    title = meta["content"].replace(" - YouTube", "").strip()
+        image = (
+            get_meta("og:image")
+            or get_name("twitter:image")
+        )
 
-            if not title and soup.title:
-                title = soup.title.string
+        site_name = get_meta("og:site_name")
 
-            # -------- IMAGE FALLBACKS --------
-            og_image = soup.find("meta", property="og:image")
-            if og_image and og_image.get("content"):
-                image = og_image["content"]
-
-            if not image:
-                twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
-                if twitter_image and twitter_image.get("content"):
-                    image = twitter_image["content"]
-
-            if title or image:
-                return {
-                    "title": title,
-                    "thumbnail_url": image
-                }
+        return {
+            "title": title,
+            "thumbnail_url": image,
+            "description": description,
+            "site_name": site_name
+        }
 
     except Exception as e:
-        logger.error(f"Static metadata error: {e}")
-
-    return None
+        logger.error(f"Metadata extraction failed: {e}")
+        return None
 
 # ============== Auth Routes ==============
 
