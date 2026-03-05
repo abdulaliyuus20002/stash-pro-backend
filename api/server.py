@@ -453,7 +453,11 @@ async def fetch_metadata_browser(url: str):
 
             page = await context.new_page()
 
-            await page.goto(url, wait_until="networkidle", timeout=45000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await page.wait_for_selector('meta[property="og:title"]', timeout=5000)
+                except:
+                    pass
 
             title = await page.evaluate("""
                 document.querySelector('meta[property="og:title"]')?.content
