@@ -400,55 +400,54 @@ async def handle_youtube(url: str):
 
     try:
 
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-        }
+        video_id = extract_youtube_video_id(url)
 
-        loop = asyncio.get_event_loop()
+        if not video_id:
+            raise Exception("Invalid YouTube URL")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(
-                None,
-                lambda: ydl.extract_info(url, download=False)
+        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+        # fetch page to get title
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"https://www.youtube.com/watch?v={video_id}",
+                headers={
+                    "User-Agent": "Mozilla/5.0"
+                }
             )
 
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        title = None
+
+        og_title = soup.find("meta", property="og:title")
+        if og_title:
+            title = og_title.get("content")
+
+        if not title:
+            title = soup.title.string if soup.title else "YouTube Video"
+
+        title = title.replace(" - YouTube", "")
+
         return {
-            "title": info.get("title") or "YouTube Video",
-            "thumbnail_url": info.get("thumbnail"),
+            "title": title,
+            "thumbnail_url": thumbnail,
             "platform": "YouTube",
             "content_type": "video",
             "suggested_tags": ["youtube", "video"]
         }
 
     except Exception as e:
+
         logger.error(f"YouTube extraction failed: {e}")
 
-        # ✅ Fallback: scrape title from page
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url)
-
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            title = soup.title.string if soup.title else "YouTube Video"
-
-            return {
-                "title": title.replace(" - YouTube", ""),
-                "thumbnail_url": None,
-                "platform": "YouTube",
-                "content_type": "video",
-                "suggested_tags": ["youtube"]
-            }
-
-        except Exception:
-            return {
-                "title": "YouTube Video",
-                "thumbnail_url": None,
-                "platform": "YouTube",
-                "content_type": "video",
-                "suggested_tags": ["youtube"]
-            }
+        return {
+            "title": "YouTube Video",
+            "thumbnail_url": None,
+            "platform": "YouTube",
+            "content_type": "video",
+            "suggested_tags": ["youtube"]
+        }
 
 async def handle_tiktok(url: str):
 
