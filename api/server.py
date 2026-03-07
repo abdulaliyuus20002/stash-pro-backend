@@ -400,23 +400,24 @@ async def handle_youtube(url: str):
 
     try:
 
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "nocheckcertificate": True
-        }
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://www.youtube.com/oembed",
+                params={
+                    "url": url,
+                    "format": "json"
+                },
+                timeout=10
+            )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        data = r.json()
 
-        title = info.get("title")
-        thumbnail = info.get("thumbnail")
+        video_id = extract_youtube_video_id(url)
 
-        if not title:
-            title = "YouTube Video"
+        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
         return {
-            "title": title,
+            "title": data.get("title"),
             "thumbnail_url": thumbnail,
             "platform": "YouTube",
             "content_type": "video",
@@ -427,9 +428,11 @@ async def handle_youtube(url: str):
 
         logger.error(f"YouTube extraction failed: {e}")
 
+        video_id = extract_youtube_video_id(url)
+
         return {
             "title": "YouTube Video",
-            "thumbnail_url": None,
+            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else None,
             "platform": "YouTube",
             "content_type": "video",
             "suggested_tags": ["youtube"]
