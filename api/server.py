@@ -36,6 +36,7 @@ from pathlib import Path
 from fastapi import Request
 from playwright.async_api import async_playwright
 import yt_dlp
+from urllib.parse import urlparse, parse_qs
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(env_path)
@@ -383,16 +384,27 @@ async def resolve_url(url: str) -> str:
         return url
 
 def extract_youtube_video_id(url: str):
-    patterns = [
-        r"youtu\.be/([^?&]+)",
-        r"youtube\.com/watch\?v=([^&]+)",
-        r"youtube\.com/shorts/([^?&]+)"
-    ]
+    parsed = urlparse(url)
 
-    for p in patterns:
-        match = re.search(p, url)
-        if match:
-            return match.group(1)
+    # Short URL: youtu.be/VIDEOID
+    if "youtu.be" in parsed.netloc:
+        return parsed.path.strip("/")
+
+    # Standard YouTube URL
+    if "youtube.com" in parsed.netloc:
+
+        # watch?v=VIDEOID
+        query = parse_qs(parsed.query)
+        if "v" in query:
+            return query["v"][0]
+
+        # shorts/VIDEOID
+        if parsed.path.startswith("/shorts/"):
+            return parsed.path.split("/")[2]
+
+        # embed/VIDEOID
+        if parsed.path.startswith("/embed/"):
+            return parsed.path.split("/")[2]
 
     return None
 
