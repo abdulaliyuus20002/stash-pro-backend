@@ -412,22 +412,40 @@ def extract_youtube_video_id(url: str):
 async def handle_x(url: str):
 
     try:
-        data = await fetch_metadata_browser(url)
 
-        if not data:
-            return None
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://publish.twitter.com/oembed",
+                params={
+                    "url": url,
+                    "omit_script": True
+                },
+                timeout=10
+            )
+
+        data = r.json()
+
+        title = data.get("author_name", "X Post")
 
         return {
-            "title": data.get("title"),
-            "thumbnail_url": data.get("thumbnail_url"),
+            "title": f"Post by {title}",
+            "thumbnail_url": None,
             "platform": "X",
             "content_type": "post",
             "suggested_tags": ["x", "post"]
         }
 
     except Exception as e:
+
         logger.error(f"X extraction failed: {e}")
-        return None
+
+        return {
+            "title": "X Post",
+            "thumbnail_url": None,
+            "platform": "X",
+            "content_type": "post",
+            "suggested_tags": ["x"]
+        }
 
 async def handle_youtube(url: str):
 
