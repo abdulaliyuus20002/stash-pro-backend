@@ -343,6 +343,8 @@ def detect_platform(url: str) -> tuple:
         'reddit.com': ('Reddit', 'post'),
         'github.com': ('GitHub', 'article'),
         'substack.com': ('Substack', 'article'),
+        "snapchat.com": ("Snapchat", "video"),
+        "story.snapchat.com": ("Snapchat", "video"),
     }
     
     for key, value in platform_map.items():
@@ -606,6 +608,18 @@ async def fetch_url_metadata(url: str):
         if x:
             return x
 
+    if platform == "Instagram":
+        browser_data = await fetch_metadata_browser(url)
+
+        if browser_data:
+            return {
+                "title": browser_data.get("title"),
+                "thumbnail_url": browser_data.get("thumbnail_url"),
+                "platform": "Instagram",
+                "content_type": "post",
+                "suggested_tags": ["instagram", "post"]
+            }
+
     
 
     # 2️⃣ Fast metadata extraction
@@ -685,6 +699,9 @@ async def fetch_metadata_static(url: str):
             get_meta("og:image")
             or get_name("twitter:image")
         )
+        if image and image.startswith("/"):
+            parsed = urlparse(url)
+            image = f"{parsed.scheme}://{parsed.netloc}{image}"
 
         site_name = get_meta("og:site_name")
 
