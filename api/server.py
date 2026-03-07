@@ -408,6 +408,27 @@ def extract_youtube_video_id(url: str):
 
     return None
 
+
+async def handle_x(url: str):
+
+    try:
+        data = await fetch_metadata_browser(url)
+
+        if not data:
+            return None
+
+        return {
+            "title": data.get("title"),
+            "thumbnail_url": data.get("thumbnail_url"),
+            "platform": "X",
+            "content_type": "post",
+            "suggested_tags": ["x", "post"]
+        }
+
+    except Exception as e:
+        logger.error(f"X extraction failed: {e}")
+        return None
+
 async def handle_youtube(url: str):
 
     try:
@@ -561,6 +582,11 @@ async def fetch_url_metadata(url: str):
         tk = await handle_tiktok(url)
         if tk:
             return tk
+
+    if platform == "X":
+        x = await handle_x(url)
+        if x:
+            return x
 
     
 
