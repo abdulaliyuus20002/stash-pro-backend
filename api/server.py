@@ -400,34 +400,20 @@ async def handle_youtube(url: str):
 
     try:
 
-        video_id = extract_youtube_video_id(url)
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "nocheckcertificate": True
+        }
 
-        if not video_id:
-            raise Exception("Invalid YouTube URL")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-
-        # fetch page to get title
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"https://www.youtube.com/watch?v={video_id}",
-                headers={
-                    "User-Agent": "Mozilla/5.0"
-                }
-            )
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        title = None
-
-        og_title = soup.find("meta", property="og:title")
-        if og_title:
-            title = og_title.get("content")
+        title = info.get("title")
+        thumbnail = info.get("thumbnail")
 
         if not title:
-            title = soup.title.string if soup.title else "YouTube Video"
-
-        title = title.replace(" - YouTube", "")
+            title = "YouTube Video"
 
         return {
             "title": title,
