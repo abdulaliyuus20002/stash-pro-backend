@@ -48,8 +48,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MONTHLY_PRICE_ID = os.environ.get("STRIPE_PRO_MONTHLY_PRICE_ID")
 YEARLY_PRICE_ID = os.environ.get("STRIPE_PRO_YEARLY_PRICE_ID")
 
-print("MONTHLY:", os.environ.get("STRIPE_SECRET_KEY"))
-print("YEARLY:", os.environ.get("STRIPE_PRO_YEARLY_PRICE_ID"))
+
 
 firebase_db = FirebaseDB()
 
@@ -1804,10 +1803,16 @@ async def get_user_plan(current_user: dict = Depends(get_current_user)):
     trial_expires_at = current_user.get("trial_expires_at")
 
     trial_expired = False
-    if current_user.get("plan_type") == "trial":
-        if trial_expires_at and trial_expires_at < datetime.utcnow():
+    if current_user.get("plan_type") == "trial" and trial_expires_at:
+
+        now = datetime.now(timezone.utc)
+
+        if trial_expires_at.tzinfo is None:
+            trial_expires_at = trial_expires_at.replace(tzinfo=timezone.utc)
+
+        if trial_expires_at < now:
             trial_expired = True
-    
+        
     # Count current usage
     
     items_count = await db.items.count_documents({"user_id": current_user["id"]})
