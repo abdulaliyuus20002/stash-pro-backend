@@ -169,7 +169,28 @@ def get_user_limits(user: dict) -> dict:
     return FREE_PLAN_LIMITS
 
 def is_pro_user(user: dict) -> bool:
-    return user.get("is_pro") or user.get("plan_type") == "pro"
+
+    now = datetime.utcnow()
+
+    # Paid Pro subscription
+    if user.get("plan_type") == "pro":
+        expires = user.get("pro_expires_at")
+
+        if expires and expires > now:
+            return True
+
+        return False
+
+    # Trial users
+    if user.get("plan_type") == "trial":
+        expires = user.get("trial_expires_at")
+
+        if expires and expires > now:
+            return True
+
+        return False
+
+    return False
 
 
 class SavedItemCreate(BaseModel):
@@ -727,12 +748,22 @@ async def register(user_data: UserCreate):
     
     # Create user
     user_id = str(uuid.uuid4())
+    trial_start = datetime.utcnow()
+    trial_end = trial_start + timedelta(days=14)
+
     user = {
         "id": user_id,
         "email": user_data.email.lower(),
         "password": hash_password(user_data.password),
         "name": user_data.name or user_data.email.split('@')[0],
-        "plan_type": "free",
+
+        "plan_type": "trial",
+        "is_pro": True,
+
+        "trial_started_at": trial_start,
+        "trial_expires_at": trial_end,
+        "trial_used": True,
+
         "created_at": datetime.utcnow()
     }
     await firebase_db.create_user(user)
@@ -1759,10 +1790,14 @@ async def get_preferences(current_user: dict = Depends(get_current_user)):
 async def get_user_plan(current_user: dict = Depends(get_current_user)):
     """Get user's current plan and limits"""
     db = get_db()
-    is_pro = (
-        current_user.get("is_pro", False)
-        or current_user.get("plan_type") == "pro"
-    )
+    is_pro = is_pro_user(current_user)
+
+    trial_expires_at = current_user.get("trial_expires_at")
+
+    trial_expired = False
+    if current_user.get("plan_type") == "trial":
+        if trial_expires_at and trial_expires_at < datetime.utcnow():
+            trial_expired = True
     
     # Count current usage
     
@@ -1772,8 +1807,10 @@ async def get_user_plan(current_user: dict = Depends(get_current_user)):
     limits = get_user_limits(current_user)
     
     return {
-        "plan_type": "pro" if is_pro else "free",
+        "plan_type": current_user.get("plan_type", "free"),
         "is_pro": is_pro,
+        "trial_expires_at": trial_expires_at,
+        "trial_expired": trial_expired,
         "pro_expires_at": current_user.get("pro_expires_at"),
         "limits": limits,
         "usage": {
@@ -2091,7 +2128,7 @@ async def create_checkout_session(
             }
         )
 
-    if current_user.get("is_pro"):
+    if is_pro_user(current_user):
         raise HTTPException(
             status_code=400,
             detail="User already has an active subscription"
@@ -2171,17 +2208,21 @@ async def stripe_webhook(request: Request):
     try:
         if event_type == "checkout.session.completed":
             await handle_checkout_completed(data)
+
         elif event_type == "invoice.payment_succeeded":
             await handle_invoice_paid(data)
+
         elif event_type == "invoice.payment_failed":
             await handle_invoice_failed(data)
+
         elif event_type == "customer.subscription.deleted":
             await handle_subscription_canceled(data)
+
         elif event_type == "customer.subscription.updated":
             await handle_subscription_updated(data)
 
-            # ✅ Mark event processed ONLY after success
-            await mark_event_processed(event)
+        await mark_event_processed(event)
+
     except Exception as e:
         logger.error(f"Webhook handler error ({event_type}): {e}")
 
