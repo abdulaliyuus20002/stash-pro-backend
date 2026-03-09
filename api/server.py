@@ -37,6 +37,7 @@ from fastapi import Request
 from playwright.async_api import async_playwright
 import yt_dlp
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(env_path)
@@ -170,23 +171,31 @@ def get_user_limits(user: dict) -> dict:
 
 def is_pro_user(user: dict) -> bool:
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
-    # Paid Pro subscription
+    # Paid Pro
     if user.get("plan_type") == "pro":
         expires = user.get("pro_expires_at")
 
-        if expires and expires > now:
-            return True
+        if expires:
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+
+            if expires > now:
+                return True
 
         return False
 
-    # Trial users
+    # Trial
     if user.get("plan_type") == "trial":
         expires = user.get("trial_expires_at")
 
-        if expires and expires > now:
-            return True
+        if expires:
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+
+            if expires > now:
+                return True
 
         return False
 
