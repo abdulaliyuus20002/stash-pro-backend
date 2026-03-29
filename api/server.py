@@ -479,35 +479,29 @@ async def handle_x(url: str):
         }
 
 async def handle_youtube(url: str):
-
     try:
-
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                "https://www.youtube.com/oembed",
-                params={
-                    "url": url,
-                    "format": "json"
-                },
-                timeout=10
-            )
-
-        data = r.json()
-
         video_id = extract_youtube_video_id(url)
 
-        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://www.youtube.com/oembed",
+                params={"url": url, "format": "json"},
+            )
 
-        return {
-            "title": data.get("title"),
-            "thumbnail_url": thumbnail,
-            "platform": "YouTube",
-            "content_type": "video",
-            "suggested_tags": ["youtube", "video"]
-        }
+        if r.status_code == 200:
+            data = r.json()
+
+            return {
+                "title": data.get("title"),
+                "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+                "platform": "YouTube",
+                "content_type": "video",
+                "suggested_tags": ["youtube", "video"],
+            }
+
+        raise Exception("oembed failed")
 
     except Exception as e:
-
         logger.error(f"YouTube extraction failed: {e}")
 
         video_id = extract_youtube_video_id(url)
@@ -517,7 +511,7 @@ async def handle_youtube(url: str):
             "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else None,
             "platform": "YouTube",
             "content_type": "video",
-            "suggested_tags": ["youtube"]
+            "suggested_tags": ["youtube"],
         }
 
 async def handle_tiktok(url: str):
@@ -614,7 +608,7 @@ async def fetch_metadata_browser(url: str):
 
 async def fetch_url_metadata(url: str):
 
-    url = await resolve_url(url)
+    
 
     platform, content_type = detect_platform(url)
 
@@ -649,10 +643,22 @@ async def fetch_url_metadata(url: str):
                 "suggested_tags": ["instagram", "post"]
             }
 
+    # url = await resolve_url(url)
+
     
 
     # 2️⃣ Fast metadata extraction
     static_data = await fetch_metadata_static(url)
+
+    if static_data:
+        return {
+            "title": static_data.get("title"),
+            "thumbnail_url": static_data.get("thumbnail_url"),
+            "platform": platform,
+            "content_type": content_type,
+            "suggested_tags": extract_suggested_tags(static_data.get("title") or "")
+        }
+
 
     if static_data:
         title = static_data.get("title")
@@ -660,7 +666,6 @@ async def fetch_url_metadata(url: str):
 
     # 3️⃣ Browser fallback
     if (not title or not image) and platform not in ["YouTube", "TikTok", "X"]:
-
         browser_data = await fetch_metadata_browser(url)
 
         if browser_data:
