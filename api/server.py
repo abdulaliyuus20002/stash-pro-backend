@@ -169,6 +169,7 @@ def get_user_limits(user: dict) -> dict:
     return FREE_PLAN_LIMITS
 
 def is_pro_user(user: dict) -> bool:
+    return user.get("is_pro", False)
 
     now = datetime.now(timezone.utc)
 
@@ -2267,6 +2268,19 @@ async def handle_checkout_completed(session):
 
     subscription = stripe.Subscription.retrieve(subscription_id)
 
+    await firebase_db.update_user(
+        user_id,
+        {
+            "is_pro": True,
+            "plan_type": "pro",
+            "pro_expires_at": datetime.utcfromtimestamp(
+                subscription["current_period_end"]
+            ),
+            "stripe_customer_id": customer_id,
+            "stripe_subscription_id": subscription.id,
+        }
+    )
+
     existing = await db.subscriptions.find_one({
         "stripe_subscription_id": subscription.id
     })
@@ -2348,13 +2362,16 @@ async def handle_invoice_paid(invoice):
     user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
 
     if user:
-        await firebase_db.update_user(user["id"], {
-            "is_pro": True,
-            "plan_type": "pro",
-            "pro_expires_at": datetime.utcfromtimestamp(
-                subscription.current_period_end
-            )
-        })
+        await firebase_db.update_user(
+            user["id"],
+            {
+                "is_pro": True,
+                "plan_type": "pro",
+                "pro_expires_at": datetime.utcfromtimestamp(
+                    subscription["current_period_end"]
+                ),
+            }
+        )
 
 
 async def handle_invoice_failed(invoice):
@@ -2403,11 +2420,14 @@ async def handle_subscription_canceled(subscription):
     user = await firebase_db.get_user_by_stripe_customer_id(customer_id)
 
     if user:
-        await firebase_db.update_user(user["id"], {
-            "is_pro": False,
-            "plan_type": "free",
-            "pro_expires_at": None
-        })
+        await firebase_db.update_user(
+            user["id"],
+            {
+                "is_pro": False,
+                "plan_type": "free",
+                "pro_expires_at": None,
+            }
+        )
 
 async def handle_subscription_updated(subscription):
     if not subscription or "id" not in subscription:
