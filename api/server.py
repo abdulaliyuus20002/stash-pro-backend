@@ -169,8 +169,6 @@ def get_user_limits(user: dict) -> dict:
     return FREE_PLAN_LIMITS
 
 def is_pro_user(user: dict) -> bool:
-    return user.get("is_pro", False)
-
     now = datetime.now(timezone.utc)
 
     # Paid Pro
@@ -191,13 +189,8 @@ def is_pro_user(user: dict) -> bool:
         expires = user.get("trial_expires_at")
 
         if expires:
-            if expires.tzinfo is None:
-                expires = expires.replace(tzinfo=timezone.utc)
-
             if expires > now:
                 return True
-
-        return False
 
     return False
 
@@ -773,10 +766,12 @@ async def register(user_data: UserCreate):
 
         "plan_type": "trial",
         "is_pro": True,
+        "subscription_provider": None,
 
         "trial_started_at": trial_start,
         "trial_expires_at": trial_end,
         "trial_used": True,
+        
 
         "created_at": datetime.utcnow()
     }
@@ -2111,6 +2106,74 @@ async def generate_item_summary(
     return {"status": "processing"}
 
 
+@api_router.post("/payments/verify-apple")
+async def verify_apple_payment(
+    data: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    receipt = data.get("receipt")
+
+    if not receipt:
+        raise HTTPException(status_code=400, detail="Receipt required")
+
+    APPLE_SHARED_SECRET = os.getenv("APPLE_SHARED_SECRET")
+
+    # 1️⃣ Verify with Apple (sandbox first)
+    response = await httpx.post(
+        "https://sandbox.itunes.apple.com/verifyReceipt",
+        json={
+            "receipt-data": receipt,
+            "password": APPLE_SHARED_SECRET
+        }
+    )
+
+    result = response.json()
+
+    # 2️⃣ If production receipt sent to sandbox
+    if result.get("status") == 21007:
+        response = await httpx.post(
+            "https://buy.itunes.apple.com/verifyReceipt",
+            json={
+                "receipt-data": receipt,
+                "password": APPLE_SHARED_SECRET
+            }
+        )
+        result = response.json()
+
+    # 3️⃣ Validate response
+    if result.get("status") != 0:
+        raise HTTPException(status_code=400, detail="Invalid receipt")
+
+    latest_receipt_info = result.get("latest_receipt_info", [])
+
+    if not latest_receipt_info:
+        raise HTTPException(status_code=400, detail="No subscription found")
+
+    latest = latest_receipt_info[-1]
+
+    expires_date_ms = int(latest["expires_date_ms"])
+    expires_date = datetime.fromtimestamp(
+        expires_date_ms / 1000,
+        tz=timezone.utc
+    )
+
+    # 4️⃣ Update user (THIS IS THE IMPORTANT PART)
+    await firebase_db.update_user(
+        current_user["id"],
+        {
+            "is_pro": True,
+            "plan_type": "pro",
+            "pro_expires_at": expires_date,
+            "subscription_provider": "apple",  # ✅ IMPORTANT
+        }
+    )
+
+    return {
+        "message": "Subscription activated",
+        "expires_at": expires_date
+    }
+
+
 @api_router.post("/payments/create-checkout-session")
 async def create_checkout_session(
     data: CheckoutSessionRequest,
@@ -2149,10 +2212,10 @@ async def create_checkout_session(
         )
 
     if is_pro_user(current_user):
-        raise HTTPException(
-            status_code=400,
-            detail="User already has an active subscription"
-        )
+        return {
+            "message": "User already subscribed",
+            "is_pro": True
+        }
 
     # 3️⃣ Create Checkout Session
     session = stripe.checkout.Session.create(
@@ -2278,6 +2341,7 @@ async def handle_checkout_completed(session):
             ),
             "stripe_customer_id": customer_id,
             "stripe_subscription_id": subscription.id,
+            "subscription_provider": "stripe",
         }
     )
 
